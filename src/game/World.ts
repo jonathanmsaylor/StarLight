@@ -11,7 +11,6 @@ const FERTILITY_ADD_PER_TOUCH = 0.25;
 const FERTILITY_DECAY_PER_SEC = 0.12;
 const GROWTH_MULT_MIN = 1.00;
 const GROWTH_MULT_MAX = 1.75;
-const FERTILITY_TINT_COLOR = 0xFFD34D;
 const FERTILITY_TINT_ALPHA_MAX = 0.15;
 const NEAR_VIS_RADIUS_TILES = 2;
 const DEBUG_FERTILITY_NUMBERS = false;
@@ -48,6 +47,32 @@ const STAR_MASS_GAIN        = 0.02;   // per absorbed crop (scale increment)
 const STAR_SCALE_MIN        = 1.00;
 const STAR_SCALE_MAX        = 1.50;
 
+/* === Star Nova (tweakable) === */
+const STAR_NOVA_SCALE        = 1.35;  // scale threshold to trigger nova
+const NOVA_RADIUS_TILES      = 3.5;   // effect radius in tiles
+const NOVA_METER_MAX         = 100;   // percent
+const NOVA_YIELD_PER_CROP    = 1;     // units per popped crop
+const NOVA_SPLIT_TO_METER    = 0.5;   // 50% to meter
+const NOVA_COOLDOWN_SEC      = 6.0;   // short cooldown; set 0 to disable
+const NOVA_TILE_FLASH_ALPHA  = 0.20;  // subtle flash opacity boost
+const NOVA_TILE_FLASH_SEC    = 0.25;  // flash fade time (seconds)
+
+/* === Stardust Garden Palette (editable) === */
+const PALETTE_LAVENDER = 0xBFA2DB;
+const PALETTE_TEAL     = 0xA2D9CE;
+const PALETTE_ROSE     = 0xF5B7B1;
+
+const GARDEN_PALETTE = [PALETTE_LAVENDER, PALETTE_TEAL, PALETTE_ROSE];
+
+/* Use a single soft pastel for the “Garden Bloom” pulse & fertility tint */
+const BLOOM_PULSE_COLOR = PALETTE_LAVENDER;
+
+/* Optional: unify your fertility overlay tint with the palette */
+const FERTILITY_TINT_COLOR = PALETTE_TEAL;
+
+/* Make absorption glitter match the palette too (we’ll pick per spawn) */
+const ABSORB_COLOR_DEFAULT = PALETTE_ROSE;
+
 /* ====== Planting rules ====== */
 const PLANT_RANGE_TILES = 1.25; // must be within this distance from tile center
 
@@ -73,6 +98,16 @@ export class World {
   private _fertilityGroup = new THREE.Group();
   private _fertilityOverlays = new Map<string, THREE.Mesh>();
   private _fertilityTextEls = new Map<string, HTMLDivElement>();
+
+private _novaCooldownLeft = 0;
+private _novaMeter = 0; // 0..NOVA_METER_MAX
+
+// tile-key -> flash end-time (seconds)
+private _novaFlashes = new Map<string, number>();
+
+// simple UI refs for the right-side meter
+private _novaMeterRoot?: HTMLDivElement;
+private _novaMeterFill?: HTMLDivElement;
 
   // Seed indicator (visible when tool === 'plant')
   private _seedGroup = new THREE.Group();
@@ -163,16 +198,33 @@ export class World {
   }
 
   // ---- crop helpers (unchanged) ----
-  private createCropMesh(stage: 0|1|2|3): THREE.Mesh {
-    const heights = [0.05, 0.15, 0.28, 0.42];
-    const colorByStage = [0x6b8f3e, 0x7da446, 0x9bbf56, 0xd6c36d];
-    const g = new THREE.ConeGeometry(0.12 + stage*0.02, heights[stage], 6);
-    const m = new THREE.MeshStandardMaterial({ color: colorByStage[stage], roughness: 0.9, metalness: 0 });
-    const mesh = new THREE.Mesh(g, m);
-    mesh.castShadow = false;
-    mesh.receiveShadow = false;
-    return mesh;
-  }
+private createCropMesh(stage: 0|1|2|3): THREE.Mesh {
+  // Keep your existing silhouette but switch to soft pastels + emissive glow
+  const heights = [0.05, 0.15, 0.28, 0.42];
+  const g = new THREE.ConeGeometry(0.12 + stage * 0.02, heights[stage], 6);
+
+  // Pick a color from the garden palette based on stage
+  const colorHex = GARDEN_PALETTE[stage % GARDEN_PALETTE.length];
+
+  const m = new THREE.MeshStandardMaterial({
+    color: colorHex,
+    emissive: colorHex,
+    emissiveIntensity: 0.25 + stage * 0.12, // slightly brighter each stage
+    roughness: 0.85,
+    metalness: 0.0
+  });
+
+  const mesh = new THREE.Mesh(g, m);
+  mesh.castShadow = false;
+  mesh.receiveShadow = false;
+
+  // Gentle stage-based scale “roundness” (purely visual; no logic impact)
+  const s = 0.95 + stage * 0.06;
+  mesh.scale.setScalar(s);
+
+  return mesh;
+}
+
   private cropKey(x:number,y:number) { return `crop-${x}-${y}`; }
   private getCropsGroup(): THREE.Group {
     const existing = this.scene.getObjectByName('crops') as THREE.Group;
@@ -316,9 +368,9 @@ private getOrCreateFertilityOverlay(x: number, y: number): THREE.Mesh {
 
   const g = new THREE.PlaneGeometry(this.grid.tileSize, this.grid.tileSize);
   const m = new THREE.MeshBasicMaterial({
-    color: FERTILITY_TINT_COLOR,
+    color: FERTILITY_TINT_COLOR,   // ← pulled from palette constants
     transparent: true,
-    opacity: 0,                 // start invisible; updated per-frame near player
+    opacity: 0,                    // updated elsewhere per-frame
     side: THREE.DoubleSide,
     depthWrite: false
   });
@@ -332,6 +384,7 @@ private getOrCreateFertilityOverlay(x: number, y: number): THREE.Mesh {
   this._fertilityOverlays.set(key, mesh);
   return mesh;
 }
+
 
 
 
@@ -519,7 +572,7 @@ private _stageLabels = new Map<string, { sprite: THREE.Sprite, stage: number }>(
     this.camera.position.lerp(target, 0.18);
     this.camera.lookAt(this.player.group.position);
   }
-private spawnAbsorbEffect(x: number, y: number) {
+private spawnAbsorbEffect(x: number, y: number, addStarGain: boolean = true) {
   // Remove crop mesh & stage label immediately
   const key = this.cropKey(x, y);
   const mesh = this.findCropMesh(x, y) as THREE.Mesh | undefined;
@@ -536,7 +589,6 @@ private spawnAbsorbEffect(x: number, y: number) {
     this._stageLabels.delete(key);
   }
 
-  // Setup particle system
   const from = this.grid.tileCenter(x, y).clone();
   from.y = 0.15;
 
@@ -544,9 +596,7 @@ private spawnAbsorbEffect(x: number, y: number) {
   const positions = new Float32Array(N * 3);
   const startOffset = new Float32Array(N * 3);
 
-  // Random points inside a sphere (burst)
   for (let i = 0; i < N; i++) {
-    // rejection sampling for unit sphere
     let ox = 0, oy = 0, oz = 0, d2 = 2;
     while (d2 > 1) {
       ox = Math.random() * 2 - 1;
@@ -554,7 +604,7 @@ private spawnAbsorbEffect(x: number, y: number) {
       oz = Math.random() * 2 - 1;
       d2 = ox*ox + oy*oy + oz*oz;
     }
-    const r = ABSORB_BURST_RADIUS * Math.cbrt(d2); // slight bias outward
+    const r = ABSORB_BURST_RADIUS * Math.cbrt(d2);
     const sx = ox * r, sy = oy * r, sz = oz * r;
 
     startOffset[i*3+0] = sx;
@@ -569,8 +619,11 @@ private spawnAbsorbEffect(x: number, y: number) {
   const geom = new THREE.BufferGeometry();
   geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
 
+  // 🎨 Pick a gentle color from the palette per absorption event
+  const absorbColor = GARDEN_PALETTE[Math.floor(Math.random() * GARDEN_PALETTE.length)] ?? ABSORB_COLOR_DEFAULT;
+
   const mat = new THREE.PointsMaterial({
-    color: ABSORB_COLOR,
+    color: absorbColor,
     size: 0.06,
     sizeAttenuation: true,
     transparent: true,
@@ -591,13 +644,150 @@ private spawnAbsorbEffect(x: number, y: number) {
     duration: ABSORB_DURATION_SEC
   });
 
-  // Bump star mass (scale target), clamped
+  if (addStarGain) {
+    this._starScaleTarget = THREE.MathUtils.clamp(
+      this._starScaleTarget + STAR_MASS_GAIN,
+      STAR_SCALE_MIN,
+      STAR_SCALE_MAX
+    );
+  }
+}
+
+private tryTriggerNova(dt: number, grid: TileState[][]) {
+  // cooldown
+  if (this._novaCooldownLeft > 0) {
+    this._novaCooldownLeft = Math.max(0, this._novaCooldownLeft - dt);
+  }
+
+  // Trigger when actual scale reaches threshold (not just the target)
+  if (this._novaCooldownLeft === 0 && this._starScale >= STAR_NOVA_SCALE) {
+    this.runNova(grid);
+    if (NOVA_COOLDOWN_SEC > 0) this._novaCooldownLeft = NOVA_COOLDOWN_SEC;
+  }
+}
+private runNova(grid: TileState[][]) {
+  // Center & radius in world units
+  const origin = this.player.group.position.clone();
+  const radiusW = NOVA_RADIUS_TILES * this.grid.tileSize;
+
+  // Tile index near the star
+  const t = this.grid.worldToTile(origin);
+  if (!t) return;
+
+  const rTiles = Math.ceil(NOVA_RADIUS_TILES);
+  let popped = 0;
+
+  for (let dy = -rTiles; dy <= rTiles; dy++) {
+    for (let dx = -rTiles; dx <= rTiles; dx++) {
+      const x = t.x + dx, y = t.y + dy;
+      if (x < 0 || y < 0 || x >= this.grid.width || y >= this.grid.height) continue;
+
+      const center = this.grid.tileCenter(x, y);
+      const d = Math.hypot(center.x - origin.x, center.z - origin.z);
+      if (d > radiusW) continue;
+
+      const tile = grid[y][x] as TileState;
+      if (!tile.crop) continue;
+
+      // If not already at stage 3, force stage 3 and pop
+      if (tile.crop.stage < 3) {
+        // mark a quick flash for this tile
+        const key = `${x},${y}`;
+        this._novaFlashes.set(key, (performance.now() * 0.001) + NOVA_TILE_FLASH_SEC);
+
+        // pop with glitter but NO star gain here (we split below)
+        this.spawnAbsorbEffect(x, y, /*addStarGain=*/false);
+        tile.crop = undefined;
+        popped++;
+      }
+    }
+  }
+
+  if (popped <= 0) return;
+
+  // Split yield
+  const totalUnits = popped * NOVA_YIELD_PER_CROP;
+  const meterUnits = totalUnits * NOVA_SPLIT_TO_METER;
+  const starUnits  = totalUnits - meterUnits;
+
+  // Meter (treat units as percentage points, clamped)
+  this._novaMeter = Math.min(NOVA_METER_MAX, this._novaMeter + meterUnits);
+
+  // Star gain from the star share
+  const starGain = STAR_MASS_GAIN * starUnits;
   this._starScaleTarget = THREE.MathUtils.clamp(
-    this._starScaleTarget + STAR_MASS_GAIN,
+    this._starScaleTarget + starGain,
     STAR_SCALE_MIN,
     STAR_SCALE_MAX
   );
 }
+private updateNovaFlashes(_dt: number) {
+  if (this._novaFlashes.size === 0) return;
+  const now = performance.now() * 0.001;
+
+  for (const [key, until] of this._novaFlashes) {
+    const remaining = until - now;
+    if (remaining <= 0) {
+      this._novaFlashes.delete(key);
+      continue;
+    }
+
+    const [sx, sy] = key.split(',').map(n => parseInt(n, 10));
+    if (Number.isNaN(sx) || Number.isNaN(sy)) continue;
+
+    const mesh = this.getOrCreateFertilityOverlay(sx, sy);
+    const mat = mesh.material as THREE.MeshBasicMaterial;
+
+    // Tint flash with the garden bloom color
+    mat.color.setHex(BLOOM_PULSE_COLOR);
+
+    // Base opacity is set by fertility visuals; apply a quick additive flash
+    const flashFactor = THREE.MathUtils.clamp(remaining / NOVA_TILE_FLASH_SEC, 0, 1);
+    const addAlpha = NOVA_TILE_FLASH_ALPHA * flashFactor;
+    mat.opacity = Math.max(mat.opacity, addAlpha);
+  }
+}
+
+private updateNovaMeterUI() {
+  // lazy create
+  if (!this._novaMeterRoot) {
+    const root = document.createElement('div');
+    Object.assign(root.style, {
+      position: 'fixed',
+      right: '16px',
+      top: '16px',
+      width: '20px',
+      height: '160px',
+      border: '1px solid rgba(255,255,255,0.25)',
+      borderRadius: '10px',
+      background: 'rgba(255,255,255,0.06)',
+      overflow: 'hidden',
+      zIndex: '9999',
+      pointerEvents: 'none'
+    });
+
+    const fill = document.createElement('div');
+    Object.assign(fill.style, {
+      position: 'absolute',
+      bottom: '0',
+      left: '0',
+      width: '100%',
+      height: '0%',
+      background: 'linear-gradient(180deg, rgba(255,255,255,0.85), rgba(255,255,255,0.35))'
+    });
+
+    root.appendChild(fill);
+    document.body.appendChild(root);
+    this._novaMeterRoot = root;
+    this._novaMeterFill = fill;
+  }
+
+  const pct = THREE.MathUtils.clamp(this._novaMeter / NOVA_METER_MAX, 0, 1) * 100;
+  if (this._novaMeterFill) {
+    this._novaMeterFill.style.height = `${pct}%`;
+  }
+}
+
 private updateAbsorptions(_dt: number) {
   if (this._absorptions.length === 0) return;
 
@@ -692,21 +882,26 @@ tick(grid: TileState[][]) {
           c.stage = (c.stage + 1) as 0 | 1 | 2 | 3;
         }
 
-        // ⭐ Hook: first frame we reach stage 3 -> pop to glitter & absorb
+        // ⭐ Normal path: first frame we reach stage 3 -> pop & absorb (adds star mass)
         if (before !== 3 && c.stage === 3) {
-          // spawn effect at this tile and remove the crop immediately
-          this.spawnAbsorbEffect(x, y);
+          this.spawnAbsorbEffect(x, y, /*addStarGain=*/true);
           tile.crop = undefined;
         }
       }
     }
   }
 
+  // Try nova (checks scale threshold & cooldown; will pop nearby crops and split yield)
+  this.tryTriggerNova(dt, grid);
+
   // Visuals that depend on crop states (labels/mesh scaling)
   this.updateCropsVisuals(grid);
 
-  // Fertility tint near the player
+  // Fertility tint near the player (base layer)
   this.updateFertilityVisualsAroundPlayer();
+
+  // Apply/decay nova tile flashes (overlays the base tint)
+  this.updateNovaFlashes(dt);
 
   // Update absorption particle effects
   this.updateAbsorptions(dt);
@@ -718,12 +913,16 @@ tick(grid: TileState[][]) {
   // Ease star scale toward target
   this._updateStarScale(dt);
 
+  // Nova meter UI
+  this.updateNovaMeterUI();
+
   // Stardust trail sim
   this._trail.update(dt);
 
   // Draw
   this.renderer.render(this.scene, this.camera);
 }
+
 
 
 
