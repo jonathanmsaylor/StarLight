@@ -38,6 +38,16 @@ const STAGE_START_COVER = [0.25, 0.55, 0.80, 0.92]; // at stage start (diameter 
 const STAGE_END_COVER   = [0.25, 0.55, 0.80, 0.92]; // at stage end   (diameter / tileSize)
 const TILE_FILL_SAFETY  = 0.98; // keep a hair inside the tile to avoid Z-fighting/overlap
 
+/* === Stardust Harvest Absorption (tweakable) === */
+const ABSORB_PARTICLE_COUNT = 28;
+const ABSORB_BURST_RADIUS   = 0.15;   // initial outward jiggle
+const ABSORB_DURATION_SEC   = 1.0;
+const ABSORB_COLOR          = 0xffffff;
+
+const STAR_MASS_GAIN        = 0.02;   // per absorbed crop (scale increment)
+const STAR_SCALE_MIN        = 1.00;
+const STAR_SCALE_MAX        = 1.50;
+
 /* ====== Planting rules ====== */
 const PLANT_RANGE_TILES = 1.25; // must be within this distance from tile center
 
@@ -172,6 +182,18 @@ export class World {
   private findCropMesh(x:number,y:number): THREE.Object3D | undefined {
     return this.getCropsGroup().children.find(o => (o as any).userData?.key === this.cropKey(x,y));
   }
+
+  private _absorptions: Array<{
+  points: THREE.Points;
+  positions: Float32Array;
+  startOffset: Float32Array;
+  from: THREE.Vector3;
+  startTime: number;    // seconds
+  duration: number;     // seconds
+}> = [];
+
+private _starScale = STAR_SCALE_MIN;
+private _starScaleTarget = STAR_SCALE_MIN;
 
 /* ============================
    Planting with proximity check
@@ -497,6 +519,138 @@ private _stageLabels = new Map<string, { sprite: THREE.Sprite, stage: number }>(
     this.camera.position.lerp(target, 0.18);
     this.camera.lookAt(this.player.group.position);
   }
+private spawnAbsorbEffect(x: number, y: number) {
+  // Remove crop mesh & stage label immediately
+  const key = this.cropKey(x, y);
+  const mesh = this.findCropMesh(x, y) as THREE.Mesh | undefined;
+  if (mesh) {
+    mesh.parent?.remove(mesh);
+    (mesh.material as THREE.Material).dispose?.();
+    (mesh.geometry as THREE.BufferGeometry).dispose?.();
+  }
+  const label = this._stageLabels.get(key);
+  if (label) {
+    label.sprite.parent?.remove(label.sprite);
+    (label.sprite.material as THREE.SpriteMaterial).map?.dispose();
+    (label.sprite.material as THREE.SpriteMaterial).dispose();
+    this._stageLabels.delete(key);
+  }
+
+  // Setup particle system
+  const from = this.grid.tileCenter(x, y).clone();
+  from.y = 0.15;
+
+  const N = ABSORB_PARTICLE_COUNT;
+  const positions = new Float32Array(N * 3);
+  const startOffset = new Float32Array(N * 3);
+
+  // Random points inside a sphere (burst)
+  for (let i = 0; i < N; i++) {
+    // rejection sampling for unit sphere
+    let ox = 0, oy = 0, oz = 0, d2 = 2;
+    while (d2 > 1) {
+      ox = Math.random() * 2 - 1;
+      oy = Math.random() * 2 - 1;
+      oz = Math.random() * 2 - 1;
+      d2 = ox*ox + oy*oy + oz*oz;
+    }
+    const r = ABSORB_BURST_RADIUS * Math.cbrt(d2); // slight bias outward
+    const sx = ox * r, sy = oy * r, sz = oz * r;
+
+    startOffset[i*3+0] = sx;
+    startOffset[i*3+1] = sy;
+    startOffset[i*3+2] = sz;
+
+    positions[i*3+0] = from.x + sx;
+    positions[i*3+1] = from.y + sy;
+    positions[i*3+2] = from.z + sz;
+  }
+
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+
+  const mat = new THREE.PointsMaterial({
+    color: ABSORB_COLOR,
+    size: 0.06,
+    sizeAttenuation: true,
+    transparent: true,
+    opacity: 1.0,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending
+  });
+
+  const points = new THREE.Points(geom, mat);
+  this.scene.add(points);
+
+  this._absorptions.push({
+    points,
+    positions,
+    startOffset,
+    from,
+    startTime: performance.now() * 0.001,
+    duration: ABSORB_DURATION_SEC
+  });
+
+  // Bump star mass (scale target), clamped
+  this._starScaleTarget = THREE.MathUtils.clamp(
+    this._starScaleTarget + STAR_MASS_GAIN,
+    STAR_SCALE_MIN,
+    STAR_SCALE_MAX
+  );
+}
+private updateAbsorptions(_dt: number) {
+  if (this._absorptions.length === 0) return;
+
+  const now = performance.now() * 0.001;
+  const starPos = this.player.group.position.clone();
+  starPos.y += 0.45; // aim slightly above the star center
+
+  // easing helper (smooth, fast finish)
+  const ease = (t: number) => 1 - (1 - t) * (1 - t);
+
+  for (let i = this._absorptions.length - 1; i >= 0; i--) {
+    const fx = this._absorptions[i];
+    const { points, positions, startOffset, from, startTime, duration } = fx;
+
+    const rawT = THREE.MathUtils.clamp((now - startTime) / Math.max(0.001, duration), 0, 1);
+    const t = ease(rawT);
+
+    // Update particle positions toward the (moving) star
+    for (let p = 0; p < positions.length; p += 3) {
+      const sx = startOffset[p];
+      const sy = startOffset[p + 1];
+      const sz = startOffset[p + 2];
+
+      // start = from + startOffset
+      // end   = starPos
+      const startX = from.x + sx;
+      const startY = from.y + sy;
+      const startZ = from.z + sz;
+
+      positions[p]     = THREE.MathUtils.lerp(startX, starPos.x, t);
+      positions[p + 1] = THREE.MathUtils.lerp(startY, starPos.y, t);
+      positions[p + 2] = THREE.MathUtils.lerp(startZ, starPos.z, t);
+    }
+
+    // fade out as they approach
+    (points.material as THREE.PointsMaterial).opacity = 1.0 - t;
+    (points.geometry.getAttribute('position') as THREE.BufferAttribute).needsUpdate = true;
+
+    // done?
+    if (rawT >= 1) {
+      points.parent?.remove(points);
+      (points.material as THREE.PointsMaterial).dispose();
+      (points.geometry as THREE.BufferGeometry).dispose();
+      this._absorptions.splice(i, 1);
+    }
+  }
+}
+private _updateStarScale(dt: number) {
+  // critically-damped-ish easing toward target
+  const k = 8.0; // responsiveness; larger = snappier
+  this._starScale += (this._starScaleTarget - this._starScale) * (1 - Math.exp(-k * dt));
+  this.player.group.scale.setScalar(this._starScale);
+}
 
   /* ============================
      Growth multiplier hook
@@ -526,6 +680,8 @@ tick(grid: TileState[][]) {
         const c = tile.crop;
         if (!c) continue;
 
+        const before = c.stage;
+
         // current fertility affects current rate; add global rate knob
         const mult = this.growthMultiplierFor(tile);            // 1.00..1.75
         c.growthMs = (c.growthMs ?? 0) + dt * mult * 1000 * GROWTH_RATE_MULT;
@@ -535,23 +691,40 @@ tick(grid: TileState[][]) {
           c.growthMs! -= BASE_STAGE_MS;
           c.stage = (c.stage + 1) as 0 | 1 | 2 | 3;
         }
+
+        // ⭐ Hook: first frame we reach stage 3 -> pop to glitter & absorb
+        if (before !== 3 && c.stage === 3) {
+          // spawn effect at this tile and remove the crop immediately
+          this.spawnAbsorbEffect(x, y);
+          tile.crop = undefined;
+        }
       }
     }
   }
 
-  // ✅ make crop meshes match updated stages AND progress
+  // Visuals that depend on crop states (labels/mesh scaling)
   this.updateCropsVisuals(grid);
 
   // Fertility tint near the player
   this.updateFertilityVisualsAroundPlayer();
 
+  // Update absorption particle effects
+  this.updateAbsorptions(dt);
+
   // Player + trail
   this._movePlayer(dt);
   this.player.updateGlow(performance.now() / 1000);
+
+  // Ease star scale toward target
+  this._updateStarScale(dt);
+
+  // Stardust trail sim
   this._trail.update(dt);
 
+  // Draw
   this.renderer.render(this.scene, this.camera);
 }
+
 
 
 
