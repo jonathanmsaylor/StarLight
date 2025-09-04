@@ -33,6 +33,10 @@ const SHIMMER_TO_METER          = 0.5;    // split to Constellation meter (0..1)
 
 /* === Palette (already added earlier) reused for shimmer colors === */
 // PALETTE_LAVENDER / TEAL / ROSE and GARDEN_PALETTE should already exist
+// === Crop tile colors by phase ===
+const STAGE0_BABY_BLUE = 0xA7D8FF; // phase 1
+const STAGE1_SOFT_ORANGE = 0xF6C28B; // phase 2
+const STAGE2_RIPPLE_GREEN = 0xA8E6A1; // final
 
 /* === Enable growth so fertility affects crops === */
 const APPLY_GROWTH_TICK = true;
@@ -116,6 +120,7 @@ export class World {
   private _trail = new Stardust();
   private _camOffset = new THREE.Vector3(6, 10, 8);
 
+
   // Fertility visuals
   private _fertilityGroup = new THREE.Group();
   private _fertilityOverlays = new Map<string, THREE.Mesh>();
@@ -137,17 +142,36 @@ private updateBloomFlashes(_dt: number) {
     }
 
     const [sx, sy] = key.split(',').map(n => parseInt(n, 10));
-    if (Number.isNaN(sx) || Number.isNaN(sy)) continue;
+if (Number.isNaN(sx) || Number.isNaN(sy)) continue;
 
-    const mesh = this.getOrCreateFertilityOverlay(sx, sy);
-    const mat = mesh.material as THREE.MeshBasicMaterial;
+const mesh = this.getOrCreateFertilityOverlay(sx, sy);
+const mat  = mesh.material as THREE.MeshBasicMaterial;
 
-    // Use garden bloom tint; additive flash over fertility tint.
-    mat.color.setHex(BLOOM_PULSE_COLOR);
+mat.color.setHex(BLOOM_PULSE_COLOR);
+const flashFactor = THREE.MathUtils.clamp(remaining / BLOOM_TILE_FLASH_SEC, 0, 1);
+mat.opacity = Math.max(mat.opacity, BLOOM_TILE_FLASH_ALPHA * flashFactor);
 
-    const flashFactor = THREE.MathUtils.clamp(remaining / BLOOM_TILE_FLASH_SEC, 0, 1);
-    const addAlpha = BLOOM_TILE_FLASH_ALPHA * flashFactor;
-    mat.opacity = Math.max(mat.opacity, addAlpha);
+  }
+}
+private _tickCropShaders(tNow: number) {
+  const group = this.getCropsGroup();
+  for (const obj of group.children) {
+    const mesh = obj as THREE.Mesh;
+    const matAny = mesh.material as THREE.Material | THREE.Material[];
+
+    if (Array.isArray(matAny)) {
+      for (const m of matAny) {
+        const sm = m as unknown as THREE.ShaderMaterial;
+        if ((sm as any)?.isShaderMaterial && sm.uniforms?.uTime) {
+          sm.uniforms.uTime.value = tNow;
+        }
+      }
+    } else {
+      const sm = matAny as unknown as THREE.ShaderMaterial;
+      if ((sm as any)?.isShaderMaterial && sm.uniforms?.uTime) {
+        sm.uniforms.uTime.value = tNow;
+      }
+    }
   }
 }
 
@@ -248,21 +272,91 @@ private _novaMeterFill?: HTMLDivElement;
 
   // ---- crop helpers (unchanged) ----
 private createCropMesh(stage: 0|1|2|3): THREE.Mesh {
-  const radius = 0.12 + stage * 0.02;
-  const g = new THREE.ConeGeometry(radius, STAGE_HEIGHTS[stage], 8, 1, false);
-  const colorHex = GARDEN_PALETTE[stage % GARDEN_PALETTE.length];
-  const m = new THREE.MeshStandardMaterial({
-    color: colorHex,
-    emissive: colorHex,
-    emissiveIntensity: 0.28 + stage * 0.12,
-    roughness: 0.85,
-    metalness: 0.0
+  // 1x1 unit square; we’ll scale it to fit the tile each frame
+  const g = new THREE.PlaneGeometry(1, 1, 1, 1);
+  g.rotateX(-Math.PI / 2); // lay flat on the ground
+
+  // pick initial A→B colors based on stage (0->1, 1->2, 2/3 stay green)
+  const colorA =
+    stage <= 0 ? STAGE0_BABY_BLUE :
+    stage === 1 ? STAGE1_SOFT_ORANGE :
+    STAGE2_RIPPLE_GREEN;
+
+  const colorB =
+    stage <= 0 ? STAGE1_SOFT_ORANGE :
+    stage === 1 ? STAGE2_RIPPLE_GREEN :
+    STAGE2_RIPPLE_GREEN;
+
+  const mat = new THREE.ShaderMaterial({
+    transparent: true,
+    depthWrite: false,
+    // (normal blending looks nicest over your tile + fertility tint)
+    blending: THREE.NormalBlending,
+    uniforms: {
+      uTime:   { value: 0 },
+      uMix:    { value: 0 }, // 0..1 within the current stage
+      uColorA: { value: new THREE.Color(colorA) },
+      uColorB: { value: new THREE.Color(colorB) },
+    },
+    vertexShader: /* glsl */`
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: /* glsl */`
+      varying vec2 vUv;
+      uniform float uTime;
+      uniform float uMix;
+      uniform vec3  uColorA;
+      uniform vec3  uColorB;
+
+      void main() {
+        // Stage color blend
+        vec3 base = mix(uColorA, uColorB, clamp(uMix, 0.0, 1.0));
+
+        // Radial ripple centered on tile
+        vec2 p = (vUv - 0.5) * 2.0;
+        float d = length(p);                 // distance from center
+        float rings = 0.5 + 0.5 * sin(10.0 * d - 4.0 * uTime);
+
+        // Subtle vignette to keep edges soft
+        float vignette = smoothstep(0.95, 0.3, d);
+
+        // Brightness modulation from ripple
+        vec3 color = base * (0.8 + 0.2 * rings);
+
+        // Slight alpha fade toward edges so it sits nicely in the tile
+        float alpha = 0.85 * vignette;
+
+        gl_FragColor = vec4(color, alpha);
+      }
+    `
   });
-  const mesh = new THREE.Mesh(g, m);
-  (mesh as any).userData.stage = stage;         // ← store stage (helps comparison)
+
+  const mesh = new THREE.Mesh(g, mat);
+  (mesh as any).userData.stage = stage; // keep stage for compare/rebuild
   mesh.castShadow = false;
   mesh.receiveShadow = false;
   return mesh;
+}
+
+// Maps crop stage -> (from color A) -> (to color B)
+// 0: baby blue -> soft orange
+// 1: soft orange -> ripple green
+// 2/3: ripple green -> ripple green (hold green in final stage)
+private _stageColors(stage: 0 | 1 | 2 | 3): { a: number; b: number } {
+  switch (stage) {
+    case 0:
+      return { a: STAGE0_BABY_BLUE, b: STAGE1_SOFT_ORANGE };
+    case 1:
+      return { a: STAGE1_SOFT_ORANGE, b: STAGE2_RIPPLE_GREEN };
+    case 2:
+    case 3:
+    default:
+      return { a: STAGE2_RIPPLE_GREEN, b: STAGE2_RIPPLE_GREEN };
+  }
 }
 
 
@@ -339,83 +433,7 @@ plant(x:number, y:number, state: TileState) {
   harvest(_x:number,_y:number,_state: TileState) { return false; } // tool removed
   plow(_x:number,_y:number,_state: TileState) { return false; }   // tool removed
 
-updateCropsVisuals(grid: TileState[][]) {
-  const group = this.getCropsGroup();
-  const activeKeys = new Set<string>();
-
-  for (let y = 0; y < grid.length; y++) {
-    for (let x = 0; x < grid[0].length; x++) {
-      const t = grid[y][x];
-      if (!t.crop) continue;
-
-      const stage = t.crop.stage;
-      const expectedHeight = STAGE_HEIGHTS[stage];   // ← use shared array
-      const key = this.cropKey(x, y);
-      activeKeys.add(key);
-
-      let mesh = this.findCropMesh(x, y) as THREE.Mesh | undefined;
-      if (mesh) {
-        // Prefer comparing by stage to avoid float param fragility:
-        const meshStage = (mesh as any).userData?.stage;
-        if (meshStage !== stage) {
-          group.remove(mesh);
-          mesh = this.createCropMesh(stage);
-          const c = this.grid.tileCenter(x, y);
-          mesh.position.set(c.x, 0.002, c.z);
-          (mesh as any).userData = { key, stage };
-          group.add(mesh);
-        }
-      } else {
-        mesh = this.createCropMesh(stage);
-        const c = this.grid.tileCenter(x, y);
-        mesh.position.set(c.x, 0.002, c.z);
-        (mesh as any).userData = { key, stage };
-        group.add(mesh);
-      }
-
-      // ... (rest of your scaling/label code unchanged)
-
-
-      // --- SIZE SCALING: make each new stage significantly bigger, then grow within the stage ---
-      // Progress within current stage [0..1]
-      const stageProgress = Math.max(0, Math.min(1, (t.crop.growthMs ?? 0) / BASE_STAGE_MS));
-
-      // Desired diameter as a fraction of tile size (big jump at stage start, then lerp within stage)
-      const coverStart = STAGE_START_COVER[stage];  // e.g., 0.20 -> 0.40 -> 0.65 -> 0.85
-      const coverEnd   = STAGE_END_COVER[stage];    // e.g., 0.40 -> 0.70 -> 0.90 -> 0.98
-      const coverFrac  = THREE.MathUtils.lerp(coverStart, coverEnd, stageProgress) * TILE_FILL_SAFETY;
-
-      // Compute uniform scale so the cone footprint matches coverFrac * tileSize
-      const baseRadius = (mesh.geometry as any).parameters?.radius ?? (0.12 + stage * 0.02);
-      const desiredDiameter = this.grid.tileSize * coverFrac;
-      const currentDiameter = 2 * baseRadius; // pre-scale diameter from geometry params
-      const scale = desiredDiameter / currentDiameter;
-      mesh.scale.setScalar(scale);
-
-      // --- Stage label sprite (billboarded number above the plant) ---
-      const label = this.getOrCreateStageLabel(x, y, stage);
-      const c = this.grid.tileCenter(x, y);
-
-      // Compute world Y for the label: base + scaled mesh height + small offset
-      const baseY = 0.002;
-      const meshHeight = ((mesh as any).geometry?.parameters?.height ?? expectedHeight) * mesh.scale.y;
-      const labelY = baseY + meshHeight + 0.12;
-
-      label.position.set(c.x, labelY, c.z);
-    }
-  }
-
-  // Cleanup labels whose crops were removed this frame
-  for (const [key, entry] of this._stageLabels) {
-    if (!activeKeys.has(key)) {
-      entry.sprite.parent?.remove(entry.sprite);
-      (entry.sprite.material as THREE.SpriteMaterial).map?.dispose();
-      (entry.sprite.material as THREE.SpriteMaterial).dispose();
-      this._stageLabels.delete(key);
-    }
-  }
-}
-
+private tileKey(x:number,y:number) { return `${x},${y}`; }
 
 private getOrCreateFertilityOverlay(x: number, y: number): THREE.Mesh {
   const key = this.tileKey(x, y);
@@ -424,15 +442,15 @@ private getOrCreateFertilityOverlay(x: number, y: number): THREE.Mesh {
 
   const g = new THREE.PlaneGeometry(this.grid.tileSize, this.grid.tileSize);
   const m = new THREE.MeshBasicMaterial({
-    color: FERTILITY_TINT_COLOR,   // ← pulled from palette constants
+    color: FERTILITY_TINT_COLOR,
     transparent: true,
-    opacity: 0,                    // updated elsewhere per-frame
+    opacity: 0,
     side: THREE.DoubleSide,
     depthWrite: false
   });
-
   const mesh = new THREE.Mesh(g, m);
   mesh.rotation.x = -Math.PI / 2;
+
   const c = this.grid.tileCenter(x, y);
   mesh.position.set(c.x, 0, c.z);
 
@@ -442,95 +460,10 @@ private getOrCreateFertilityOverlay(x: number, y: number): THREE.Mesh {
 }
 
 
-
-
-
   /* ============================
      Fertility application/visuals
      ============================ */
-  private tileKey(x:number,y:number) { return `${x},${y}`; }
-private makeStageNumberTexture(stage: number): THREE.CanvasTexture {
-  const size = 128; // higher = crisper
-  const canvas = document.createElement('canvas');
-  canvas.width = size; canvas.height = size;
-  const ctx = canvas.getContext('2d')!;
 
-  // Clear
-  ctx.clearRect(0, 0, size, size);
-
-  // Soft glow circle
-  const r = size * 0.48;
-  const cx = size * 0.5, cy = size * 0.5;
-  const grad = ctx.createRadialGradient(cx, cy, r * 0.2, cx, cy, r);
-  grad.addColorStop(0, 'rgba(255, 211, 77, 0.75)');
-  grad.addColorStop(1, 'rgba(255, 211, 77, 0.00)');
-  ctx.fillStyle = grad;
-  ctx.beginPath();
-  ctx.arc(cx, cy, r, 0, Math.PI * 2);
-  ctx.fill();
-
-  // Number with outline
-  const label = String(stage);
-  ctx.font = `bold ${Math.floor(size * 0.56)}px system-ui, sans-serif`;
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-
-  // Outline
-  ctx.lineWidth = Math.max(2, Math.floor(size * 0.06));
-  ctx.strokeStyle = 'rgba(0,0,0,0.85)';
-  ctx.strokeText(label, cx, cy);
-
-  // Fill
-  ctx.fillStyle = '#ffffff';
-  ctx.fillText(label, cx, cy);
-
-  const tex = new THREE.CanvasTexture(canvas);
-  tex.anisotropy = this.renderer.capabilities.getMaxAnisotropy?.() ?? 1;
-  tex.magFilter = THREE.LinearFilter;
-  tex.minFilter = THREE.LinearMipmapLinearFilter;
-  tex.needsUpdate = true;
-  return tex;
-}
-
-private getOrCreateStageLabel(x: number, y: number, stage: number): THREE.Sprite {
-  const key = this.cropKey(x, y);
-  const existing = this._stageLabels.get(key);
-
-  // If exists and same stage, just return it
-  if (existing && existing.stage === stage) {
-    return existing.sprite;
-  }
-
-  // If exists but stage changed, redraw the texture
-  if (existing && existing.stage !== stage) {
-    const mat = existing.sprite.material as THREE.SpriteMaterial;
-    mat.map?.dispose();
-    mat.map = this.makeStageNumberTexture(stage);
-    mat.needsUpdate = true;
-    existing.stage = stage;
-    return existing.sprite;
-  }
-
-  // Create a new sprite
-  const tex = this.makeStageNumberTexture(stage);
-  const mat = new THREE.SpriteMaterial({
-    map: tex,
-    transparent: true,
-    depthWrite: false
-  });
-  const sprite = new THREE.Sprite(mat);
-
-  // Size relative to tile; tune if needed
-  const size = 0.35 * this.grid.tileSize; // width and height in world units
-  sprite.scale.set(size, size, 1);
-
-  this.scene.add(sprite); // add to scene root so it always billboards to camera
-  this._stageLabels.set(key, { sprite, stage });
-
-  return sprite;
-}
-
-private _stageLabels = new Map<string, { sprite: THREE.Sprite, stage: number }>();
 
   private applyFertilityAtPosition(pos: THREE.Vector3) {
     const t = this.grid.worldToTile(pos);
@@ -555,6 +488,7 @@ private _stageLabels = new Map<string, { sprite: THREE.Sprite, stage: number }>(
   }
 
   private updateFertilityVisualsAroundPlayer() {
+    
     const t = this.grid.worldToTile(this.player.group.position);
     if (!t) return;
 
@@ -574,9 +508,8 @@ private _stageLabels = new Map<string, { sprite: THREE.Sprite, stage: number }>(
           if (mesh) (mesh.material as THREE.MeshBasicMaterial).opacity = 0;
           continue;
         }
-
-        const mesh = this.getOrCreateFertilityOverlay(x,y);
-        (mesh.material as THREE.MeshBasicMaterial).opacity = FERTILITY_TINT_ALPHA_MAX * f;
+const mesh = this.getOrCreateFertilityOverlay(x,y);
+(mesh.material as THREE.MeshBasicMaterial).opacity = FERTILITY_TINT_ALPHA_MAX * f;
 
         if (DEBUG_FERTILITY_NUMBERS) {
           const el = this._fertilityTextEls.get(key);
@@ -637,13 +570,7 @@ private spawnAbsorbEffect(x: number, y: number, addStarGain: boolean = true) {
     (mesh.material as THREE.Material).dispose?.();
     (mesh.geometry as THREE.BufferGeometry).dispose?.();
   }
-  const label = this._stageLabels.get(key);
-  if (label) {
-    label.sprite.parent?.remove(label.sprite);
-    (label.sprite.material as THREE.SpriteMaterial).map?.dispose();
-    (label.sprite.material as THREE.SpriteMaterial).dispose();
-    this._stageLabels.delete(key);
-  }
+
 
   const from = this.grid.tileCenter(x, y).clone();
   from.y = 0.15;
@@ -789,10 +716,15 @@ private updateNovaFlashes(_dt: number) {
     }
 
     const [sx, sy] = key.split(',').map(n => parseInt(n, 10));
+    // inside the for-loop, after sx/sy:
+const mesh = this.getOrCreateFertilityOverlay(sx, sy);
+const mat = mesh.material as THREE.MeshBasicMaterial;
+
+// Tint flash with the garden bloom color
+mat.color.setHex(BLOOM_PULSE_COLOR);
+
     if (Number.isNaN(sx) || Number.isNaN(sy)) continue;
 
-    const mesh = this.getOrCreateFertilityOverlay(sx, sy);
-    const mat = mesh.material as THREE.MeshBasicMaterial;
 
     // Tint flash with the garden bloom color
     mat.color.setHex(BLOOM_PULSE_COLOR);
@@ -909,7 +841,9 @@ tick(grid: TileState[][]) {
   for (let y = 0; y < this.grid.height; y++) {
     for (let x = 0; x < this.grid.width; x++) {
       const t = grid[y][x] as TileState;
-      if ((t.fertility ?? 0) > 0) t.fertility = Math.max(0, (t.fertility ?? 0) - decay);
+      if ((t.fertility ?? 0) > 0) {
+        t.fertility = Math.max(0, (t.fertility ?? 0) - decay);
+      }
     }
   }
 
@@ -918,7 +852,8 @@ tick(grid: TileState[][]) {
     for (let y = 0; y < grid.length; y++) {
       for (let x = 0; x < grid[0].length; x++) {
         const tile = grid[y][x] as TileState;
-        const c = tile.crop; if (!c) continue;
+        const c = tile.crop;
+        if (!c) continue;
 
         const before = c.stage;
         const mult = this.growthMultiplierFor(tile);
@@ -929,11 +864,32 @@ tick(grid: TileState[][]) {
           c.stage = (c.stage + 1) as 0 | 1 | 2 | 3;
         }
 
-        // 🌸 NEW: on first frame reaching stage 3, DO NOT remove the crop.
-        // Register a shimmer emitter for this tile (periodic gentle sparkle).
+        // 🌸 NEW: continuous shader update for stage fade
+        const stageProgress = Math.max(
+          0,
+          Math.min(1, (c.growthMs ?? 0) / BASE_STAGE_MS)
+        );
+        const mesh = this.findCropMesh(x, y) as THREE.Mesh | undefined;
+        if (mesh) {
+          const sm = mesh.material as unknown as THREE.ShaderMaterial;
+          if ((sm as any)?.isShaderMaterial) {
+            if (sm.uniforms?.uMix) sm.uniforms.uMix.value = stageProgress;
+
+            const prevStage = (mesh as any).userData?.stage;
+            if (prevStage !== c.stage) {
+              const { a, b } = this._stageColors(c.stage);
+              if (sm.uniforms?.uColorA) sm.uniforms.uColorA.value.setHex(a);
+              if (sm.uniforms?.uColorB) sm.uniforms.uColorB.value.setHex(b);
+              if (sm.uniforms?.uMix) sm.uniforms.uMix.value = 0.0;
+              (mesh as any).userData.stage = c.stage;
+            }
+          }
+        }
+
+        // On first frame reaching stage 3, register shimmer emitter
         if (before !== 3 && c.stage === 3) {
           const key = this.cropKey(x, y);
-          this._bloomEmitters.set(key, performance.now() * 0.001); // emit immediately
+          this._bloomEmitters.set(key, performance.now() * 0.001);
         }
       }
     }
@@ -945,16 +901,13 @@ tick(grid: TileState[][]) {
   // Try a Garden Bloom (scale threshold + cooldown)
   this.tryTriggerBloom(dt, grid);
 
-  // Visuals that depend on crop states (labels/mesh scaling)
-  this.updateCropsVisuals(grid);
-
   // Fertility tint & Bloom flashes
   this.updateFertilityVisualsAroundPlayer();
   this.updateBloomFlashes(dt);
 
   // Update particle FX
   this.updateShimmers(dt);
-  this.updateAbsorptions(dt); // (absorption is still used elsewhere if you kept it)
+  this.updateAbsorptions(dt);
 
   // Player + trail
   this._movePlayer(dt);
@@ -967,10 +920,14 @@ tick(grid: TileState[][]) {
   // Stardust trail sim
   this._trail.update(dt);
 
+  // Drive ripple time on crop square shaders
+  const tNow = performance.now() * 0.001;
+  this._tickCropShaders(tNow);
+
   // Draw
   this.renderer.render(this.scene, this.camera);
-  
 }
+
 // Emit gentle shimmer from stage-3 plants, split yield to star + constellation meter.
 private updateBloomEmitters(grid: TileState[][]) {
   const now = performance.now() * 0.001;
