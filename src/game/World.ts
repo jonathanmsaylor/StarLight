@@ -99,9 +99,19 @@ const FERTILITY_TINT_COLOR = PALETTE_TEAL;
 /* Make absorption glitter match the palette too (we’ll pick per spawn) */
 const ABSORB_COLOR_DEFAULT = PALETTE_ROSE;
 
+// === Caustics Wash (soft additive light ripples) ===
+const CAUSTICS_INTENSITY   = 0.06;   // overall strength (try 0.03–0.10)
+const CAUSTICS_SPEED_1     = 0.30;   // radians/sec
+const CAUSTICS_SPEED_2     = -0.22;  // radians/sec
+const CAUSTICS_SCALE_1     = 1.7;    // tiling freq 1
+const CAUSTICS_SCALE_2     = 1.2;    // tiling freq 2
+const CAUSTICS_COLOR_HEX   = 0xBFD9FF; // soft moonlight blue (white also fine)
+
 /* ====== Planting rules ====== */
 const PLANT_RANGE_TILES = 1.25; // must be within this distance from tile center
-
+// --- Fertility tide (gentle global alpha wave) ---
+const FERTILITY_TIDE_PERIOD_SEC = 12;   // one full swell every ~12s
+const FERTILITY_TIDE_STRENGTH   = 0.35; // 0..0.9 (how deep the dip goes)
 export class World {
   public scene = new THREE.Scene();
   public camera: THREE.PerspectiveCamera;
@@ -120,6 +130,7 @@ export class World {
   private _trail = new Stardust();
   private _camOffset = new THREE.Vector3(6, 10, 8);
 
+private _caustics?: THREE.Mesh;
 
   // Fertility visuals
   private _fertilityGroup = new THREE.Group();
@@ -174,6 +185,87 @@ private _tickCropShaders(tNow: number) {
     }
   }
 }
+// Creates a thin plane over the ground that draws faint, slow caustic ripples.
+private _createCausticsWash() {
+  // Full board size in world units
+  const w = this.grid.width  * this.grid.tileSize;
+  const h = this.grid.height * this.grid.tileSize;
+
+  const geo = new THREE.PlaneGeometry(w, h, 1, 1);
+  geo.rotateX(-Math.PI / 2); // flat on ground
+
+  const mat = new THREE.ShaderMaterial({
+    transparent: true,
+    depthWrite: false,
+    depthTest: true,
+    blending: THREE.AdditiveBlending,
+    uniforms: {
+      uTime:      { value: 0 },
+      uIntensity: { value: CAUSTICS_INTENSITY },
+      uColor:     { value: new THREE.Color(CAUSTICS_COLOR_HEX) },
+      uS1:        { value: CAUSTICS_SCALE_1 },
+      uS2:        { value: CAUSTICS_SCALE_2 },
+      uV1:        { value: CAUSTICS_SPEED_1 },
+      uV2:        { value: CAUSTICS_SPEED_2 },
+    },
+    vertexShader: /* glsl */`
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0);
+      }
+    `,
+    fragmentShader: /* glsl */`
+      precision mediump float;
+      varying vec2 vUv;
+      uniform float uTime;
+      uniform float uIntensity;
+      uniform vec3  uColor;
+      uniform float uS1, uS2;   // spatial scales
+      uniform float uV1, uV2;   // temporal speeds
+
+      // two simple interfering wavefields → faint "water light" look
+      void main() {
+        // tile UVs a bit so pattern has small ripples over the whole board
+        vec2 p1 = vUv * (6.2831853 * uS1);
+        vec2 p2 = vUv * (6.2831853 * uS2);
+
+        float t = uTime;
+
+        float w1 = sin(p1.x + t*uV1) * cos(p1.y - t*uV1);
+        float w2 = sin((p2.x+p2.y) - t*uV2) * cos((p2.x-p2.y) + t*uV2);
+
+        // centered, subtle signal 0..1
+        float ripple = 0.5 + 0.5 * (w1 + w2) * 0.5;
+
+        // super gentle edge falloff so the rectangle feels soft
+        float edge = smoothstep(0.0, 0.08, vUv.x) * smoothstep(0.0, 0.08, 1.0 - vUv.x)
+                   * smoothstep(0.0, 0.08, vUv.y) * smoothstep(0.0, 0.08, 1.0 - vUv.y);
+
+        float a = uIntensity * ripple * edge;
+
+        gl_FragColor = vec4(uColor, a);
+      }
+    `
+  });
+
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.position.set(0, 0.001, 0); // sit just above ground (below crops/overlays)
+  mesh.frustumCulled = false;
+  // Make sure it renders before fertility overlays (those sit ~0.004 high)
+  mesh.renderOrder = 0;
+
+  this._caustics = mesh;
+  this.scene.add(mesh);
+}
+// Update the caustics time uniform (called each frame)
+private _tickCausticsWash(tNow: number) {
+  if (!this._caustics) return;
+  const sm = this._caustics.material as THREE.ShaderMaterial;
+  if ((sm as any)?.isShaderMaterial && sm.uniforms?.uTime) {
+    sm.uniforms.uTime.value = tNow;
+  }
+}
 
 // tile-key -> flash end-time (seconds)
 private _novaFlashes = new Map<string, number>();
@@ -215,6 +307,7 @@ private _novaMeterFill?: HTMLDivElement;
       }
     }
     this.scene.add(this.grid.group);
+this._createCausticsWash();
 
     // Fertility overlays
     this._fertilityGroup.name = 'fertility';
@@ -225,22 +318,7 @@ private _novaMeterFill?: HTMLDivElement;
     this.player.group.position.copy(this.grid.tileCenter(6, 6)).add(new THREE.Vector3(0, 0.25, 0));
     this.scene.add(this.player.group);
 
-    // Seed indicator (small rotating seed above the star)
-    {
-      const seedGeo = new THREE.CapsuleGeometry(0.06, 0.10, 4, 8);
-      const seedMat = new THREE.MeshStandardMaterial({
-        color: 0x9b6b3d,
-        emissive: 0x332015,
-        roughness: 0.6,
-        metalness: 0.05
-      });
-      const seedMesh = new THREE.Mesh(seedGeo, seedMat);
-      seedMesh.castShadow = false;
-      this._seedGroup.add(seedMesh);
-      this._seedGroup.position.set(0, 0.55, 0); // hover above star
-      this.player.group.add(this._seedGroup);
-      this._seedGroup.visible = true; // tool defaults to 'plant'
-    }
+    
 
     // Stardust trail
     this.scene.add(this._trail.points);
@@ -341,6 +419,7 @@ private createCropMesh(stage: 0|1|2|3): THREE.Mesh {
   mesh.receiveShadow = false;
   return mesh;
 }
+
 
 // Maps crop stage -> (from color A) -> (to color B)
 // 0: baby blue -> soft orange
@@ -487,46 +566,55 @@ private getOrCreateFertilityOverlay(x: number, y: number): THREE.Mesh {
     }
   }
 
-  private updateFertilityVisualsAroundPlayer() {
-    
-    const t = this.grid.worldToTile(this.player.group.position);
-    if (!t) return;
+private updateFertilityVisualsAroundPlayer() {
+  const tIdx = this.grid.worldToTile(this.player.group.position);
+  if (!tIdx) return;
 
-    const r = NEAR_VIS_RADIUS_TILES;
+  // Global “tide” factor, synced across all tiles (no per-tile noise)
+  const now = performance.now() * 0.001;
+  const phase = (now % FERTILITY_TIDE_PERIOD_SEC) / FERTILITY_TIDE_PERIOD_SEC; // 0..1
+  const swell = 0.5 + 0.5 * Math.sin(phase * Math.PI * 2); // smooth 0..1
+  const tide  = THREE.MathUtils.lerp(1 - FERTILITY_TIDE_STRENGTH, 1, swell); // e.g. 0.65..1
 
-    for (let dy = -r; dy <= r; dy++) {
-      for (let dx = -r; dx <= r; dx++) {
-        const x = t.x + dx, y = t.y + dy;
-        if (x < 0 || y < 0 || x >= this.grid.width || y >= this.grid.height) continue;
+  const r = NEAR_VIS_RADIUS_TILES;
 
-        const tile = this.grid.tiles[y][x] as TileState;
-        const f = THREE.MathUtils.clamp(tile.fertility ?? 0, 0, 1);
-        const key = this.tileKey(x,y);
+  for (let dy = -r; dy <= r; dy++) {
+    for (let dx = -r; dx <= r; dx++) {
+      const x = tIdx.x + dx, y = tIdx.y + dy;
+      if (x < 0 || y < 0 || x >= this.grid.width || y >= this.grid.height) continue;
 
-        if (f <= 0.001) {
-          const mesh = this._fertilityOverlays.get(key);
-          if (mesh) (mesh.material as THREE.MeshBasicMaterial).opacity = 0;
-          continue;
-        }
-const mesh = this.getOrCreateFertilityOverlay(x,y);
-(mesh.material as THREE.MeshBasicMaterial).opacity = FERTILITY_TINT_ALPHA_MAX * f;
+      const tile = this.grid.tiles[y][x] as TileState;
+      const f = THREE.MathUtils.clamp(tile.fertility ?? 0, 0, 1);
+      const key = this.tileKey(x, y);
 
-        if (DEBUG_FERTILITY_NUMBERS) {
-          const el = this._fertilityTextEls.get(key);
-          if (el) {
-            const v = this.grid.tileCenter(x,y).clone();
-            v.project(this.camera);
-            const rect = this.renderer.domElement.getBoundingClientRect();
-            const sx = (v.x * 0.5 + 0.5) * rect.width + rect.left;
-            const sy = (-v.y * 0.5 + 0.5) * rect.height + rect.top;
-            el.style.left = `${sx - 8}px`;
-            el.style.top  = `${sy - 8}px`;
-            el.textContent = f.toFixed(2);
-          }
+      if (f <= 0.001) {
+        const mesh = this._fertilityOverlays.get(key);
+        if (mesh) (mesh.material as THREE.MeshBasicMaterial).opacity = 0;
+        continue;
+      }
+
+      // Base fertility alpha, gently modulated by the tide
+      const mesh = this.getOrCreateFertilityOverlay(x, y);
+      const mat  = mesh.material as THREE.MeshBasicMaterial;
+      mat.opacity = FERTILITY_TINT_ALPHA_MAX * f * tide;
+
+      if (DEBUG_FERTILITY_NUMBERS) {
+        const el = this._fertilityTextEls.get(key);
+        if (el) {
+          const v = this.grid.tileCenter(x, y).clone();
+          v.project(this.camera);
+          const rect = this.renderer.domElement.getBoundingClientRect();
+          const sx = (v.x * 0.5 + 0.5) * rect.width + rect.left;
+          const sy = (-v.y * 0.5 + 0.5) * rect.height + rect.top;
+          el.style.left = `${sx - 8}px`;
+          el.style.top  = `${sy - 8}px`;
+          el.textContent = f.toFixed(2);
         }
       }
     }
   }
+}
+
 
   /* ============================
      Player movement
@@ -710,21 +798,13 @@ private updateNovaFlashes(_dt: number) {
 
   for (const [key, until] of this._novaFlashes) {
     const remaining = until - now;
-    if (remaining <= 0) {
-      this._novaFlashes.delete(key);
-      continue;
-    }
+    if (remaining <= 0) { this._novaFlashes.delete(key); continue; }
 
     const [sx, sy] = key.split(',').map(n => parseInt(n, 10));
-    // inside the for-loop, after sx/sy:
-const mesh = this.getOrCreateFertilityOverlay(sx, sy);
-const mat = mesh.material as THREE.MeshBasicMaterial;
+    if (Number.isNaN(sx) || Number.isNaN(sy)) continue;  // ✅ validate first
 
-// Tint flash with the garden bloom color
-mat.color.setHex(BLOOM_PULSE_COLOR);
-
-    if (Number.isNaN(sx) || Number.isNaN(sy)) continue;
-
+    const mesh = this.getOrCreateFertilityOverlay(sx, sy);
+    const mat  = mesh.material as THREE.MeshBasicMaterial;
 
     // Tint flash with the garden bloom color
     mat.color.setHex(BLOOM_PULSE_COLOR);
@@ -735,6 +815,7 @@ mat.color.setHex(BLOOM_PULSE_COLOR);
     mat.opacity = Math.max(mat.opacity, addAlpha);
   }
 }
+
 
 private updateConstellationMeterUI() {
   if (!this._novaMeterRoot) {
@@ -923,6 +1004,7 @@ tick(grid: TileState[][]) {
   // Drive ripple time on crop square shaders
   const tNow = performance.now() * 0.001;
   this._tickCropShaders(tNow);
+this._tickCausticsWash(tNow);
 
   // Draw
   this.renderer.render(this.scene, this.camera);
