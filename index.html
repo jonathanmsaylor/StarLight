@@ -35,17 +35,42 @@
         position:fixed; top:8px; right:8px; color:#8aa; font:600 12px system-ui; z-index:12; opacity:.8;
         background:rgba(255,255,255,.06); padding:6px 8px; border-radius:10px; border:1px solid rgba(255,255,255,.1);
       }
+      /* Bubble FAB menu (bottom-left to avoid your right-side joystick) */
+.menu-root { position: fixed; left: 16px; bottom: 16px; z-index: 10000; }
+
+.fab {
+  width: 56px; height: 56px; border-radius: 50%;
+  display: grid; place-items: center;
+  background: rgba(255,255,255,0.12);
+  border: 1px solid rgba(255,255,255,0.2);
+  color: #fff; font: 700 20px system-ui; cursor: pointer;
+  box-shadow: 0 6px 20px rgba(0,0,0,.35);
+}
+
+.menu-panel {
+  position: absolute; left: 0; bottom: 72px; /* stack upward */
+  display: none; gap: 8px; flex-direction: column;
+}
+
+.menu-panel.open { display: flex; }
+
+.menu-btn {
+  min-width: 120px; height: 40px; border-radius: 14px;
+  background: rgba(255,255,255,.08);
+  border: 1px solid rgba(255,255,255,.12);
+  color:#fff; font:600 14px system-ui; text-align:left; padding: 0 12px;
+}
+.menu-btn[aria-pressed="true"] {
+  background: rgba(86,193,255,.25);
+  border-color: rgba(86,193,255,.5);
+}
+
     </style>
   </head>
   <body>
     <div id="app"></div>
-    <div class="hud">
-      <button class="btn" id="tool-plant" aria-pressed="true">🌱 Plant</button>
-      <button class="btn" id="tool-harvest" aria-pressed="false">🧺 Harvest</button>
-      <button class="btn" id="tool-plow" aria-pressed="false">🪓 Plow</button>
-      <button class="btn" id="tool-save">💾 Save</button>
-      <button class="btn" id="tool-load">📂 Load</button>
-    </div>
+    <div id="menu-root"></div>
+
     <div class="corner" id="clock">Day 1 • 06:00</div>
     <div class="toast" id="toast"></div>
     <script type="module" src="/src/main.ts"></script>

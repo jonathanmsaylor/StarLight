@@ -21,27 +21,42 @@ function createJoystick() {
   const base = document.createElement('div');
   const knob = document.createElement('div');
 
-  Object.assign(base.style, {
-    position:'fixed', left:'16px', bottom:'16px',
-    width:'120px', height:'120px', borderRadius:'999px',
-    background:'rgba(255,255,255,0.06)', border:'1px solid rgba(255,255,255,0.15)',
-    touchAction:'none', zIndex:'9999'
-  });
-  Object.assign(knob.style, {
-    position:'absolute', left:'50%', top:'50%', transform:'translate(-50%,-50%)',
-    width:'64px', height:'64px', borderRadius:'999px',
-    background:'rgba(255,255,255,0.18)', border:'1px solid rgba(255,255,255,0.25)'
-  });
+Object.assign(base.style, {
+  position:'fixed',
+  right:'26px',       // ⬅️ Left instead of right
+  bottom:'26px',     // sits above screen edge
+  width:'100px',     // medium size: comfortable but not oversized
+  height:'100px',
+  borderRadius:'999px',
+  background:'rgba(255,255,255,0.06)',
+  border:'1px solid rgba(255, 255, 255, 0.02)',
+  touchAction:'none',
+  zIndex:'9999'
+});
+Object.assign(knob.style, {
+  position:'absolute',
+  left:'50%',
+  top:'50%',
+  transform:'translate(-50%,-50%)',
+  width:'48px',
+  height:'48px',
+  borderRadius:'999px',
+  background:'rgba(255,255,255,0.18)',
+  border:'1px solid rgba(255,255,255,0.25)'
+});
 
   base.appendChild(knob);
   document.body.appendChild(base);
   joy.base = base; joy.knob = knob;
 
-  const maxR = 50; // px radius for full deflection
+  const maxR = 44; // was 50 — adjust drag radius to match smaller size
 
   const posFromEvent = (e: Touch | PointerEvent) => {
     const rect = base.getBoundingClientRect();
-    return { x: e.clientX - (rect.left + rect.width/2), y: e.clientY - (rect.top + rect.height/2) };
+    return {
+      x: (e as PointerEvent).clientX - (rect.left + rect.width/2),
+      y: (e as PointerEvent).clientY - (rect.top + rect.height/2)
+    };
   };
 
   const apply = (dx: number, dy: number) => {
@@ -49,11 +64,11 @@ function createJoystick() {
     const clamped = Math.min(1, len / maxR);
     const nx = (len > 0 ? dx / len : 0) * clamped;
     const ny = (len > 0 ? dy / len : 0) * clamped;
-    // screen coords: right is +x, down is +y  -> we want up as +1, so invert y
     joy.x = nx;
-    joy.y = -ny;
+    joy.y = -ny; // up = +1
     if (joy.knob) {
-      joy.knob.style.transform = `translate(calc(-50% + ${nx*maxR}px), calc(-50% + ${ny*maxR}px))`;
+      joy.knob.style.transform =
+        `translate(calc(-50% + ${nx*maxR}px), calc(-50% + ${ny*maxR}px))`;
     }
   };
 
@@ -62,22 +77,22 @@ function createJoystick() {
     if (joy.knob) joy.knob.style.transform = 'translate(-50%,-50%)';
   };
 
-  // Touch-first (works for Pointer too)
-  base.addEventListener('pointerdown', (e) => {
+  base.addEventListener('pointerdown', (e: PointerEvent) => {
     joy.active = true;
-    (e.target as HTMLElement).setPointerCapture?.((e as PointerEvent).pointerId);
-    const p = posFromEvent(e as PointerEvent);
+    (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
+    const p = posFromEvent(e);
     apply(p.x, p.y);
   }, { passive: true } as any);
 
-  window.addEventListener('pointermove', (e) => {
+  window.addEventListener('pointermove', (e: PointerEvent) => {
     if (!joy.active) return;
-    const p = posFromEvent(e as PointerEvent);
+    const p = posFromEvent(e);
     apply(p.x, p.y);
   }, { passive: true } as any);
 
   window.addEventListener('pointerup', () => clear(), { passive: true } as any);
 }
+
 
 export function bindInput(world: World, _gridState: any, onAction: (tool:Tool, x:number, y:number)=>void) {
   const dom = world.renderer.domElement;

@@ -74,14 +74,19 @@ export class World {
     this.renderer.setSize(w, h);
   }
 
-  screenToWorld(x: number, y: number): THREE.Vector3 | null {
-    const rect = this.renderer.domElement.getBoundingClientRect();
-    const nx = ((x - rect.left) / rect.width) * 2 - 1;
-    const ny = -((y - rect.top) / rect.height) * 2 + 1;
-    this.raycaster.setFromCamera({ x: nx, y: ny }, this.camera);
-    const hit = this.raycaster.intersectObject(this.grid.plane, false)[0];
-    return hit ? hit.point : null;
-  }
+screenToWorld(x: number, y: number): THREE.Vector3 | null {
+  const rect = this.renderer.domElement.getBoundingClientRect();
+  const nx = ((x - rect.left) / rect.width) * 2 - 1;
+  const ny = -((y - rect.top) / rect.height) * 2 + 1;
+
+  // ✅ Use a Vector2, not a plain object
+  this.mouse.set(nx, ny);
+  this.raycaster.setFromCamera(this.mouse, this.camera);
+
+  const hit = this.raycaster.intersectObject(this.grid.plane, false)[0];
+  return hit ? hit.point : null;
+}
+
 
   // (unchanged crop helpers omitted for brevity — keep your existing ones)
   private createCropMesh(stage: 0|1|2|3): THREE.Mesh {
