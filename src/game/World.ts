@@ -34,8 +34,8 @@ const STAGE_SCALE_GAIN  = [0.15, 0.10, 0.37, 0.00]; // extra scale added across 
 /* === Tile fill targets (how wide the crop should be vs. tile) ===
    We lerp from START -> END within each stage. 1.0 means "exactly tile width".
 */
-const STAGE_START_COVER = [0.20, 0.40, 0.65, 0.85]; // at stage start (diameter / tileSize)
-const STAGE_END_COVER   = [0.40, 0.70, 0.90, 0.98]; // at stage end   (diameter / tileSize)
+const STAGE_START_COVER = [0.25, 0.55, 0.80, 0.92]; // at stage start (diameter / tileSize)
+const STAGE_END_COVER   = [0.25, 0.55, 0.80, 0.92]; // at stage end   (diameter / tileSize)
 const TILE_FILL_SAFETY  = 0.98; // keep a hair inside the tile to avoid Z-fighting/overlap
 
 /* ====== Planting rules ====== */
@@ -209,8 +209,11 @@ plant(x:number, y:number, state: TileState) {
 updateCropsVisuals(grid: TileState[][]) {
   const group = this.getCropsGroup();
 
-  // Must mirror createCropMesh()’s intent
+  // Must mirror createCropMesh()’s geometry intent
   const heights = [0.05, 0.15, 0.28, 0.42];
+
+  // Track which keys are active this frame (for cleaning up labels)
+  const activeKeys = new Set<string>();
 
   for (let y = 0; y < grid.length; y++) {
     for (let x = 0; x < grid[0].length; x++) {
@@ -219,48 +222,95 @@ updateCropsVisuals(grid: TileState[][]) {
 
       const stage = t.crop.stage;
       const expectedHeight = heights[stage];
+      const key = this.cropKey(x, y);
+      activeKeys.add(key);
 
       // Ensure a mesh exists and matches the current stage's geometry
       let mesh = this.findCropMesh(x, y) as THREE.Mesh | undefined;
       if (mesh) {
         const currentHeight = (mesh as any).geometry?.parameters?.height ?? 0;
         if (Math.abs(currentHeight - expectedHeight) > 0.01) {
-          // Stage changed -> rebuild mesh for that stage
+          // Stage changed -> rebuild mesh for that stage (we will re-apply scale below)
           group.remove(mesh);
           mesh = this.createCropMesh(stage);
           const c = this.grid.tileCenter(x, y);
           mesh.position.set(c.x, 0.002, c.z);
-          (mesh as any).userData = { key: this.cropKey(x, y) };
+          (mesh as any).userData = { key };
           group.add(mesh);
         }
       } else {
         mesh = this.createCropMesh(stage);
         const c = this.grid.tileCenter(x, y);
         mesh.position.set(c.x, 0.002, c.z);
-        (mesh as any).userData = { key: this.cropKey(x, y) };
+        (mesh as any).userData = { key };
         group.add(mesh);
       }
 
-      // --- Size scaling to fill the tile by late game ---
-      // Progress within the current stage [0..1]
+      // --- SIZE SCALING: make each new stage significantly bigger, then grow within the stage ---
+      // Progress within current stage [0..1]
       const stageProgress = Math.max(0, Math.min(1, (t.crop.growthMs ?? 0) / BASE_STAGE_MS));
 
-      // Desired diameter as a fraction of tile size (lerp per-stage start->end)
-      const coverStart = STAGE_START_COVER[stage];
-      const coverEnd   = STAGE_END_COVER[stage];
+      // Desired diameter as a fraction of tile size (big jump at stage start, then lerp within stage)
+      const coverStart = STAGE_START_COVER[stage];  // e.g., 0.20 -> 0.40 -> 0.65 -> 0.85
+      const coverEnd   = STAGE_END_COVER[stage];    // e.g., 0.40 -> 0.70 -> 0.90 -> 0.98
       const coverFrac  = THREE.MathUtils.lerp(coverStart, coverEnd, stageProgress) * TILE_FILL_SAFETY;
 
-      // Compute the uniform scale needed so the cone's *footprint diameter* matches coverFrac * tileSize
-      // ConeGeometry parameters include the base radius we authored in createCropMesh()
+      // Compute uniform scale so the cone footprint matches coverFrac * tileSize
       const baseRadius = (mesh.geometry as any).parameters?.radius ?? (0.12 + stage * 0.02);
       const desiredDiameter = this.grid.tileSize * coverFrac;
-      const currentDiameter = 2 * baseRadius; // before scaling
+      const currentDiameter = 2 * baseRadius; // pre-scale diameter from geometry params
       const scale = desiredDiameter / currentDiameter;
-
       mesh.scale.setScalar(scale);
+
+      // --- Stage label sprite (billboarded number above the plant) ---
+      const label = this.getOrCreateStageLabel(x, y, stage);
+      const c = this.grid.tileCenter(x, y);
+
+      // Compute world Y for the label: base + scaled mesh height + small offset
+      const baseY = 0.002;
+      const meshHeight = ((mesh as any).geometry?.parameters?.height ?? expectedHeight) * mesh.scale.y;
+      const labelY = baseY + meshHeight + 0.12;
+
+      label.position.set(c.x, labelY, c.z);
+    }
+  }
+
+  // Cleanup labels whose crops were removed this frame
+  for (const [key, entry] of this._stageLabels) {
+    if (!activeKeys.has(key)) {
+      entry.sprite.parent?.remove(entry.sprite);
+      (entry.sprite.material as THREE.SpriteMaterial).map?.dispose();
+      (entry.sprite.material as THREE.SpriteMaterial).dispose();
+      this._stageLabels.delete(key);
     }
   }
 }
+
+
+private getOrCreateFertilityOverlay(x: number, y: number): THREE.Mesh {
+  const key = this.tileKey(x, y);
+  const existing = this._fertilityOverlays.get(key);
+  if (existing) return existing;
+
+  const g = new THREE.PlaneGeometry(this.grid.tileSize, this.grid.tileSize);
+  const m = new THREE.MeshBasicMaterial({
+    color: FERTILITY_TINT_COLOR,
+    transparent: true,
+    opacity: 0,                 // start invisible; updated per-frame near player
+    side: THREE.DoubleSide,
+    depthWrite: false
+  });
+
+  const mesh = new THREE.Mesh(g, m);
+  mesh.rotation.x = -Math.PI / 2;
+  const c = this.grid.tileCenter(x, y);
+  mesh.position.set(c.x, 0, c.z);
+
+  this._fertilityGroup.add(mesh);
+  this._fertilityOverlays.set(key, mesh);
+  return mesh;
+}
+
 
 
 
@@ -268,40 +318,88 @@ updateCropsVisuals(grid: TileState[][]) {
      Fertility application/visuals
      ============================ */
   private tileKey(x:number,y:number) { return `${x},${y}`; }
+private makeStageNumberTexture(stage: number): THREE.CanvasTexture {
+  const size = 128; // higher = crisper
+  const canvas = document.createElement('canvas');
+  canvas.width = size; canvas.height = size;
+  const ctx = canvas.getContext('2d')!;
 
-  private getOrCreateFertilityOverlay(x:number,y:number): THREE.Mesh {
-    const key = this.tileKey(x,y);
-    const existing = this._fertilityOverlays.get(key);
-    if (existing) return existing;
+  // Clear
+  ctx.clearRect(0, 0, size, size);
 
-    const g = new THREE.PlaneGeometry(this.grid.tileSize, this.grid.tileSize);
-    const m = new THREE.MeshBasicMaterial({
-      color: FERTILITY_TINT_COLOR,
-      transparent: true,
-      opacity: 0,
-      side: THREE.DoubleSide,
-      depthWrite: false
-    });
-    const mesh = new THREE.Mesh(g, m);
-    mesh.rotation.x = -Math.PI / 2;
-    const c = this.grid.tileCenter(x,y);
-    mesh.position.set(c.x, 0, c.z);
-    this._fertilityGroup.add(mesh);
-    this._fertilityOverlays.set(key, mesh);
+  // Soft glow circle
+  const r = size * 0.48;
+  const cx = size * 0.5, cy = size * 0.5;
+  const grad = ctx.createRadialGradient(cx, cy, r * 0.2, cx, cy, r);
+  grad.addColorStop(0, 'rgba(255, 211, 77, 0.75)');
+  grad.addColorStop(1, 'rgba(255, 211, 77, 0.00)');
+  ctx.fillStyle = grad;
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.fill();
 
-    if (DEBUG_FERTILITY_NUMBERS) {
-      const el = document.createElement('div');
-      el.style.position = 'absolute';
-      el.style.font = '600 10px system-ui';
-      el.style.color = '#ffd34d';
-      el.style.pointerEvents = 'none';
-      el.style.opacity = '0.8';
-      document.body.appendChild(el);
-      this._fertilityTextEls.set(key, el);
-    }
+  // Number with outline
+  const label = String(stage);
+  ctx.font = `bold ${Math.floor(size * 0.56)}px system-ui, sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
 
-    return mesh;
+  // Outline
+  ctx.lineWidth = Math.max(2, Math.floor(size * 0.06));
+  ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+  ctx.strokeText(label, cx, cy);
+
+  // Fill
+  ctx.fillStyle = '#ffffff';
+  ctx.fillText(label, cx, cy);
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.anisotropy = this.renderer.capabilities.getMaxAnisotropy?.() ?? 1;
+  tex.magFilter = THREE.LinearFilter;
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+private getOrCreateStageLabel(x: number, y: number, stage: number): THREE.Sprite {
+  const key = this.cropKey(x, y);
+  const existing = this._stageLabels.get(key);
+
+  // If exists and same stage, just return it
+  if (existing && existing.stage === stage) {
+    return existing.sprite;
   }
+
+  // If exists but stage changed, redraw the texture
+  if (existing && existing.stage !== stage) {
+    const mat = existing.sprite.material as THREE.SpriteMaterial;
+    mat.map?.dispose();
+    mat.map = this.makeStageNumberTexture(stage);
+    mat.needsUpdate = true;
+    existing.stage = stage;
+    return existing.sprite;
+  }
+
+  // Create a new sprite
+  const tex = this.makeStageNumberTexture(stage);
+  const mat = new THREE.SpriteMaterial({
+    map: tex,
+    transparent: true,
+    depthWrite: false
+  });
+  const sprite = new THREE.Sprite(mat);
+
+  // Size relative to tile; tune if needed
+  const size = 0.35 * this.grid.tileSize; // width and height in world units
+  sprite.scale.set(size, size, 1);
+
+  this.scene.add(sprite); // add to scene root so it always billboards to camera
+  this._stageLabels.set(key, { sprite, stage });
+
+  return sprite;
+}
+
+private _stageLabels = new Map<string, { sprite: THREE.Sprite, stage: number }>();
 
   private applyFertilityAtPosition(pos: THREE.Vector3) {
     const t = this.grid.worldToTile(pos);
