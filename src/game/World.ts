@@ -14,9 +14,31 @@ const GROWTH_MULT_MAX = 1.75;
 const FERTILITY_TINT_ALPHA_MAX = 0.15;
 const NEAR_VIS_RADIUS_TILES = 2;
 const DEBUG_FERTILITY_NUMBERS = false;
+/* === Constellation Meter (UI) === */
+const CONSTELLATION_METER_MAX   = 100;
+
+/* === Garden Bloom (Nova rebrand) === */
+const BLOOM_SCALE_THRESHOLD     = 1.35;   // star scale to trigger a bloom
+const BLOOM_RADIUS_TILES        = 3.5;
+const BLOOM_COOLDOWN_SEC        = 6.0;
+const BLOOM_TILE_FLASH_ALPHA    = 0.20;
+const BLOOM_TILE_FLASH_SEC      = 0.25;
+
+/* === Stage-3 Shimmer (FX hook – non-destructive) === */
+const SHIMMER_PARTICLE_COUNT    = 12;
+const SHIMMER_DURATION_SEC      = 0.9;
+const SHIMMER_PERIOD_SEC        = 1.2;    // how often stage-3 plants emit
+const SHIMMER_STAR_GAIN         = 0.005;  // star scale gained per shimmer
+const SHIMMER_TO_METER          = 0.5;    // split to Constellation meter (0..1)
+
+/* === Palette (already added earlier) reused for shimmer colors === */
+// PALETTE_LAVENDER / TEAL / ROSE and GARDEN_PALETTE should already exist
 
 /* === Enable growth so fertility affects crops === */
 const APPLY_GROWTH_TICK = true;
+
+// Shared crop heights by stage (single source of truth)
+const STAGE_HEIGHTS = [0.06, 0.16, 0.30, 0.46];
 
 /* === Debug speed so you can SEE growth quickly === */
 const DEBUG_FAST_GROWTH = true;
@@ -101,6 +123,33 @@ export class World {
 
 private _novaCooldownLeft = 0;
 private _novaMeter = 0; // 0..NOVA_METER_MAX
+
+// Fades the soft tile flash created by a Garden Bloom pulse.
+private updateBloomFlashes(_dt: number) {
+  if (this._bloomFlashes.size === 0) return;
+  const now = performance.now() * 0.001;
+
+  for (const [key, until] of this._bloomFlashes) {
+    const remaining = until - now;
+    if (remaining <= 0) { 
+      this._bloomFlashes.delete(key); 
+      continue; 
+    }
+
+    const [sx, sy] = key.split(',').map(n => parseInt(n, 10));
+    if (Number.isNaN(sx) || Number.isNaN(sy)) continue;
+
+    const mesh = this.getOrCreateFertilityOverlay(sx, sy);
+    const mat = mesh.material as THREE.MeshBasicMaterial;
+
+    // Use garden bloom tint; additive flash over fertility tint.
+    mat.color.setHex(BLOOM_PULSE_COLOR);
+
+    const flashFactor = THREE.MathUtils.clamp(remaining / BLOOM_TILE_FLASH_SEC, 0, 1);
+    const addAlpha = BLOOM_TILE_FLASH_ALPHA * flashFactor;
+    mat.opacity = Math.max(mat.opacity, addAlpha);
+  }
+}
 
 // tile-key -> flash end-time (seconds)
 private _novaFlashes = new Map<string, number>();
@@ -199,31 +248,24 @@ private _novaMeterFill?: HTMLDivElement;
 
   // ---- crop helpers (unchanged) ----
 private createCropMesh(stage: 0|1|2|3): THREE.Mesh {
-  // Keep your existing silhouette but switch to soft pastels + emissive glow
-  const heights = [0.05, 0.15, 0.28, 0.42];
-  const g = new THREE.ConeGeometry(0.12 + stage * 0.02, heights[stage], 6);
-
-  // Pick a color from the garden palette based on stage
+  const radius = 0.12 + stage * 0.02;
+  const g = new THREE.ConeGeometry(radius, STAGE_HEIGHTS[stage], 8, 1, false);
   const colorHex = GARDEN_PALETTE[stage % GARDEN_PALETTE.length];
-
   const m = new THREE.MeshStandardMaterial({
     color: colorHex,
     emissive: colorHex,
-    emissiveIntensity: 0.25 + stage * 0.12, // slightly brighter each stage
+    emissiveIntensity: 0.28 + stage * 0.12,
     roughness: 0.85,
     metalness: 0.0
   });
-
   const mesh = new THREE.Mesh(g, m);
+  (mesh as any).userData.stage = stage;         // ← store stage (helps comparison)
   mesh.castShadow = false;
   mesh.receiveShadow = false;
-
-  // Gentle stage-based scale “roundness” (purely visual; no logic impact)
-  const s = 0.95 + stage * 0.06;
-  mesh.scale.setScalar(s);
-
   return mesh;
 }
+
+
 
   private cropKey(x:number,y:number) { return `crop-${x}-${y}`; }
   private getCropsGroup(): THREE.Group {
@@ -234,6 +276,26 @@ private createCropMesh(stage: 0|1|2|3): THREE.Mesh {
   private findCropMesh(x:number,y:number): THREE.Object3D | undefined {
     return this.getCropsGroup().children.find(o => (o as any).userData?.key === this.cropKey(x,y));
   }
+// Stage-3 shimmer emitters: tileKey -> next emit time (seconds)
+private _bloomEmitters = new Map<string, number>();
+
+// Active shimmer particle batches
+private _shimmers: Array<{
+  points: THREE.Points;
+  positions: Float32Array;
+  from: THREE.Vector3;
+  startTime: number;        // seconds
+  duration: number;         // seconds
+}> = [];
+
+// Constellation meter (rebrand)
+private _constellationMeter = 0; // 0..CONSTELLATION_METER_MAX
+
+// Bloom flashes (tileKey -> until time in seconds)
+private _bloomFlashes = new Map<string, number>();
+
+// Bloom cooldown
+private _bloomCooldownLeft = 0;
 
   private _absorptions: Array<{
   points: THREE.Points;
@@ -251,7 +313,6 @@ private _starScaleTarget = STAR_SCALE_MIN;
    Planting with proximity check
    ============================ */
 plant(x:number, y:number, state: TileState) {
-  // MUST be close enough
   const center = this.grid.tileCenter(x, y);
   const dx = this.player.group.position.x - center.x;
   const dz = this.player.group.position.z - center.z;
@@ -259,22 +320,20 @@ plant(x:number, y:number, state: TileState) {
   const maxDist = PLANT_RANGE_TILES * this.grid.tileSize;
   if (dist > maxDist) return false;
 
-  // Tile must be soil and empty
   if (state.type !== 'soil') return false;
   if (state.crop) return false;
 
-  // Create crop with growth accumulator
   state.crop = { kind: 'wheat', plantedAt: Date.now(), stage: 0, growthMs: 0 };
 
   const mesh = this.createCropMesh(0);
   mesh.position.set(center.x, 0.002, center.z);
-  (mesh as any).userData = { key: this.cropKey(x, y) };
-  this.getCropsGroup().add(mesh);
+  (mesh as any).userData = { key: this.cropKey(x, y), stage: 0 }; // set once
+  this.getCropsGroup().add(mesh);                                  // add once
 
-  // Tiny fertility nudge on planting (optional)
   state.fertility = Math.min(1, (state.fertility ?? 0) + 0.15);
   return true;
 }
+
 
 
   harvest(_x:number,_y:number,_state: TileState) { return false; } // tool removed
@@ -282,11 +341,6 @@ plant(x:number, y:number, state: TileState) {
 
 updateCropsVisuals(grid: TileState[][]) {
   const group = this.getCropsGroup();
-
-  // Must mirror createCropMesh()’s geometry intent
-  const heights = [0.05, 0.15, 0.28, 0.42];
-
-  // Track which keys are active this frame (for cleaning up labels)
   const activeKeys = new Set<string>();
 
   for (let y = 0; y < grid.length; y++) {
@@ -295,30 +349,32 @@ updateCropsVisuals(grid: TileState[][]) {
       if (!t.crop) continue;
 
       const stage = t.crop.stage;
-      const expectedHeight = heights[stage];
+      const expectedHeight = STAGE_HEIGHTS[stage];   // ← use shared array
       const key = this.cropKey(x, y);
       activeKeys.add(key);
 
-      // Ensure a mesh exists and matches the current stage's geometry
       let mesh = this.findCropMesh(x, y) as THREE.Mesh | undefined;
       if (mesh) {
-        const currentHeight = (mesh as any).geometry?.parameters?.height ?? 0;
-        if (Math.abs(currentHeight - expectedHeight) > 0.01) {
-          // Stage changed -> rebuild mesh for that stage (we will re-apply scale below)
+        // Prefer comparing by stage to avoid float param fragility:
+        const meshStage = (mesh as any).userData?.stage;
+        if (meshStage !== stage) {
           group.remove(mesh);
           mesh = this.createCropMesh(stage);
           const c = this.grid.tileCenter(x, y);
           mesh.position.set(c.x, 0.002, c.z);
-          (mesh as any).userData = { key };
+          (mesh as any).userData = { key, stage };
           group.add(mesh);
         }
       } else {
         mesh = this.createCropMesh(stage);
         const c = this.grid.tileCenter(x, y);
         mesh.position.set(c.x, 0.002, c.z);
-        (mesh as any).userData = { key };
+        (mesh as any).userData = { key, stage };
         group.add(mesh);
       }
+
+      // ... (rest of your scaling/label code unchanged)
+
 
       // --- SIZE SCALING: make each new stage significantly bigger, then grow within the stage ---
       // Progress within current stage [0..1]
@@ -748,8 +804,7 @@ private updateNovaFlashes(_dt: number) {
   }
 }
 
-private updateNovaMeterUI() {
-  // lazy create
+private updateConstellationMeterUI() {
   if (!this._novaMeterRoot) {
     const root = document.createElement('div');
     Object.assign(root.style, {
@@ -765,7 +820,6 @@ private updateNovaMeterUI() {
       zIndex: '9999',
       pointerEvents: 'none'
     });
-
     const fill = document.createElement('div');
     Object.assign(fill.style, {
       position: 'absolute',
@@ -775,18 +829,15 @@ private updateNovaMeterUI() {
       height: '0%',
       background: 'linear-gradient(180deg, rgba(255,255,255,0.85), rgba(255,255,255,0.35))'
     });
-
     root.appendChild(fill);
     document.body.appendChild(root);
-    this._novaMeterRoot = root;
+    this._novaMeterRoot = root;     // reuse existing refs
     this._novaMeterFill = fill;
   }
-
-  const pct = THREE.MathUtils.clamp(this._novaMeter / NOVA_METER_MAX, 0, 1) * 100;
-  if (this._novaMeterFill) {
-    this._novaMeterFill.style.height = `${pct}%`;
-  }
+  const pct = THREE.MathUtils.clamp(this._constellationMeter / CONSTELLATION_METER_MAX, 0, 1) * 100;
+  if (this._novaMeterFill) this._novaMeterFill.style.height = `${pct}%`;
 }
+
 
 private updateAbsorptions(_dt: number) {
   if (this._absorptions.length === 0) return;
@@ -853,7 +904,7 @@ private _updateStarScale(dt: number) {
 tick(grid: TileState[][]) {
   const dt = this._clock.getDelta();
 
-  // Fertility decay (global; grid is small)
+  // Fertility decay
   const decay = FERTILITY_DECAY_PER_SEC * dt;
   for (let y = 0; y < this.grid.height; y++) {
     for (let x = 0; x < this.grid.width; x++) {
@@ -867,61 +918,215 @@ tick(grid: TileState[][]) {
     for (let y = 0; y < grid.length; y++) {
       for (let x = 0; x < grid[0].length; x++) {
         const tile = grid[y][x] as TileState;
-        const c = tile.crop;
-        if (!c) continue;
+        const c = tile.crop; if (!c) continue;
 
         const before = c.stage;
-
-        // current fertility affects current rate; add global rate knob
-        const mult = this.growthMultiplierFor(tile);            // 1.00..1.75
+        const mult = this.growthMultiplierFor(tile);
         c.growthMs = (c.growthMs ?? 0) + dt * mult * 1000 * GROWTH_RATE_MULT;
 
-        // Promote stages when enough effective time has accumulated
         while (c.stage < 3 && (c.growthMs ?? 0) >= BASE_STAGE_MS) {
           c.growthMs! -= BASE_STAGE_MS;
           c.stage = (c.stage + 1) as 0 | 1 | 2 | 3;
         }
 
-        // ⭐ Normal path: first frame we reach stage 3 -> pop & absorb (adds star mass)
+        // 🌸 NEW: on first frame reaching stage 3, DO NOT remove the crop.
+        // Register a shimmer emitter for this tile (periodic gentle sparkle).
         if (before !== 3 && c.stage === 3) {
-          this.spawnAbsorbEffect(x, y, /*addStarGain=*/true);
-          tile.crop = undefined;
+          const key = this.cropKey(x, y);
+          this._bloomEmitters.set(key, performance.now() * 0.001); // emit immediately
         }
       }
     }
   }
 
-  // Try nova (checks scale threshold & cooldown; will pop nearby crops and split yield)
-  this.tryTriggerNova(dt, grid);
+  // Emit shimmers from any stage-3 plants on their cadence
+  this.updateBloomEmitters(grid);
+
+  // Try a Garden Bloom (scale threshold + cooldown)
+  this.tryTriggerBloom(dt, grid);
 
   // Visuals that depend on crop states (labels/mesh scaling)
   this.updateCropsVisuals(grid);
 
-  // Fertility tint near the player (base layer)
+  // Fertility tint & Bloom flashes
   this.updateFertilityVisualsAroundPlayer();
+  this.updateBloomFlashes(dt);
 
-  // Apply/decay nova tile flashes (overlays the base tint)
-  this.updateNovaFlashes(dt);
-
-  // Update absorption particle effects
-  this.updateAbsorptions(dt);
+  // Update particle FX
+  this.updateShimmers(dt);
+  this.updateAbsorptions(dt); // (absorption is still used elsewhere if you kept it)
 
   // Player + trail
   this._movePlayer(dt);
   this.player.updateGlow(performance.now() / 1000);
 
-  // Ease star scale toward target
+  // Star easing & UI
   this._updateStarScale(dt);
-
-  // Nova meter UI
-  this.updateNovaMeterUI();
+  this.updateConstellationMeterUI();
 
   // Stardust trail sim
   this._trail.update(dt);
 
   // Draw
   this.renderer.render(this.scene, this.camera);
+  
 }
+// Emit gentle shimmer from stage-3 plants, split yield to star + constellation meter.
+private updateBloomEmitters(grid: TileState[][]) {
+  const now = performance.now() * 0.001;
+  for (const [key, nextAt] of this._bloomEmitters) {
+    if (now < nextAt) continue;
+
+    // Support both "crop-x-y" and "x,y"
+    let x: number, y: number;
+    if (key.startsWith('crop-')) {
+      const parts = key.split('-'); // ["crop","x","y"]
+      x = parseInt(parts[1], 10);
+      y = parseInt(parts[2], 10);
+    } else {
+      const parts = key.split(','); // ["x","y"]
+      x = parseInt(parts[0], 10);
+      y = parseInt(parts[1], 10);
+    }
+    if (Number.isNaN(x) || Number.isNaN(y)) { this._bloomEmitters.delete(key); continue; }
+
+    const tile = (grid[y]?.[x] as TileState | undefined);
+    if (!tile?.crop || tile.crop.stage !== 3) { this._bloomEmitters.delete(key); continue; }
+
+    // Spawn shimmer FX (cheap Points) from this tile to the star
+    this.spawnShimmerFromTile(x, y);
+
+    // Split “yield” of 1 unit per shimmer
+    this._constellationMeter = Math.min(CONSTELLATION_METER_MAX,
+      this._constellationMeter + (1 * SHIMMER_TO_METER));
+    this._starScaleTarget = THREE.MathUtils.clamp(
+      this._starScaleTarget + SHIMMER_STAR_GAIN * (1 - SHIMMER_TO_METER),
+      STAR_SCALE_MIN, STAR_SCALE_MAX
+    );
+
+    // Schedule next emission
+    this._bloomEmitters.set(key, now + SHIMMER_PERIOD_SEC);
+  }
+}
+
+private tryTriggerBloom(dt: number, grid: TileState[][]) {
+  if (this._bloomCooldownLeft > 0) {
+    this._bloomCooldownLeft = Math.max(0, this._bloomCooldownLeft - dt);
+  }
+  if (this._bloomCooldownLeft === 0 && this._starScale >= BLOOM_SCALE_THRESHOLD) {
+    this.runBloom(grid);
+    if (BLOOM_COOLDOWN_SEC > 0) this._bloomCooldownLeft = BLOOM_COOLDOWN_SEC;
+  }
+}
+
+private runBloom(grid: TileState[][]) {
+  const origin = this.player.group.position.clone();
+  const radiusW = BLOOM_RADIUS_TILES * this.grid.tileSize;
+  const t = this.grid.worldToTile(origin); if (!t) return;
+
+  const rTiles = Math.ceil(BLOOM_RADIUS_TILES);
+
+  for (let dy = -rTiles; dy <= rTiles; dy++) {
+    for (let dx = -rTiles; dx <= rTiles; dx++) {
+      const x = t.x + dx, y = t.y + dy;
+      if (x < 0 || y < 0 || x >= this.grid.width || y >= this.grid.height) continue;
+
+      const center = this.grid.tileCenter(x, y);
+      if (Math.hypot(center.x - origin.x, center.z - origin.z) > radiusW) continue;
+
+      const tile = grid[y][x] as TileState;
+      const c = tile.crop;
+      if (!c) continue;
+
+      // Harmony: instantly bloom to stage 3 (no removal), then shimmer passes will take over
+      if (c.stage < 3) {
+        c.stage = 3 as 0|1|2|3;
+        c.growthMs = 0; // optional: start progress fresh
+        const key = this.cropKey(x, y);
+        this._bloomEmitters.set(key, performance.now() * 0.001); // emit immediately
+      }
+
+      // Soft tile flash to visualize the pulse
+      const flashKey = `${x},${y}`;
+      this._bloomFlashes.set(flashKey, (performance.now() * 0.001) + BLOOM_TILE_FLASH_SEC);
+    }
+  }
+}
+
+private spawnShimmerFromTile(x: number, y: number) {
+  const from = this.grid.tileCenter(x, y).clone(); from.y = 0.18;
+
+  const N = SHIMMER_PARTICLE_COUNT;
+  const positions = new Float32Array(N * 3);
+
+  // tiny outward jitter
+  for (let i = 0; i < N; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const r = (Math.random() * 0.06) + 0.02;
+    positions[i*3+0] = from.x + Math.cos(a) * r;
+    positions[i*3+1] = from.y + (Math.random() * 0.04);
+    positions[i*3+2] = from.z + Math.sin(a) * r;
+  }
+
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+
+  const colorHex = GARDEN_PALETTE[Math.floor(Math.random()*GARDEN_PALETTE.length)];
+  const mat = new THREE.PointsMaterial({
+    color: colorHex,
+    size: 0.045,
+    sizeAttenuation: true,
+    transparent: true,
+    opacity: 0.95,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending
+  });
+
+  const points = new THREE.Points(geom, mat);
+  this.scene.add(points);
+
+  this._shimmers.push({
+    points,
+    positions,
+    from,
+    startTime: performance.now() * 0.001,
+    duration: SHIMMER_DURATION_SEC
+  });
+}
+
+private updateShimmers(_dt: number) {
+  if (this._shimmers.length === 0) return;
+
+  const now = performance.now() * 0.001;
+  const starPos = this.player.group.position.clone(); starPos.y += 0.45;
+  const ease = (t: number) => 1 - (1 - t) * (1 - t);
+
+  for (let i = this._shimmers.length - 1; i >= 0; i--) {
+    const fx = this._shimmers[i];
+    const t = THREE.MathUtils.clamp((now - fx.startTime) / Math.max(0.001, fx.duration), 0, 1);
+    const s = ease(t);
+
+    // lerp each particle from 'from' to star
+    const pos = fx.positions;
+    for (let p = 0; p < pos.length; p += 3) {
+      const sx = pos[p], sy = pos[p+1], sz = pos[p+2];
+      pos[p]   = THREE.MathUtils.lerp(sx, starPos.x, s);
+      pos[p+1] = THREE.MathUtils.lerp(sy, starPos.y, s);
+      pos[p+2] = THREE.MathUtils.lerp(sz, starPos.z, s);
+    }
+
+    (fx.points.geometry.getAttribute('position') as THREE.BufferAttribute).needsUpdate = true;
+    (fx.points.material as THREE.PointsMaterial).opacity = 1.0 - s;
+
+    if (t >= 1) {
+      fx.points.parent?.remove(fx.points);
+      (fx.points.material as THREE.PointsMaterial).dispose();
+      (fx.points.geometry as THREE.BufferGeometry).dispose();
+      this._shimmers.splice(i, 1);
+    }
+  }
+}
+
 
 
 
