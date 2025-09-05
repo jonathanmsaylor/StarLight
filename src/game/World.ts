@@ -38,6 +38,21 @@ const STAGE0_BABY_BLUE = 0xA7D8FF; // phase 1
 const STAGE1_SOFT_ORANGE = 0xF6C28B; // phase 2
 const STAGE2_RIPPLE_GREEN = 0xA8E6A1; // final
 
+// === Deep Ocean palette ===
+const OCEAN_BG      = 0x070C16;  // scene backdrop (very dark navy)
+const OCEAN_GROUND  = 0x0A1220;  // base ground deck
+const OCEAN_GRID    = 0x132433;  // grid line color
+const CAUSTICS_COLOR= 0xBFD9FF;  // for the upcoming caustics wash
+// === Dream Pool palette ===
+const DREAM_COL_A    = 0x1C2E58;  // deep indigo
+const DREAM_COL_B    = 0x103A55;  // blue-teal
+const DREAM_CAUSTICS = 0xBFD9FF;  // pale aqua glow
+const DREAM_LAVENDER = 0xC7B7FF;  // soft lavender accent
+
+// Caustics tuning for the ground shader (not the overlay)
+const DREAM_INTENSITY = 0.12;     // 0..0.6 is nice
+const DREAM_SCALE     = 2.95;     // smaller -> larger waves (world units)
+
 /* === Enable growth so fertility affects crops === */
 const APPLY_GROWTH_TICK = true;
 
@@ -286,7 +301,7 @@ private _novaMeterFill?: HTMLDivElement;
     container.appendChild(this.renderer.domElement);
 
     // Scene + Camera
-    this.scene.background = new THREE.Color(0x0a0f17);
+    this.scene.background = new THREE.Color(OCEAN_BG);
     const aspect = container.clientWidth / container.clientHeight;
     this.camera = new THREE.PerspectiveCamera(55, aspect, 0.1, 100);
 
@@ -307,6 +322,33 @@ private _novaMeterFill?: HTMLDivElement;
       }
     }
     this.scene.add(this.grid.group);
+    // Apply Deep Ocean palette to ground + grid
+{
+this._installDreamPoolGround();   // apply the dreamy ground shader
+this._createCausticsWash();       // (optional) additive ripples overlay you added
+
+
+// Caustics tuning
+const DREAM_INTENSITY = 0.22;   // 0..0.6 is nice
+const DREAM_SCALE     = 0.45;   // smaller -> larger waves (world units)
+
+  // Ground plane (the thing you raycast against)
+  const planeMat = this.grid.plane.material as any;
+  if (planeMat?.color) planeMat.color.setHex(OCEAN_GROUND);
+  if ('transparent' in planeMat) { planeMat.transparent = false; planeMat.opacity = 1; }
+
+  // Grid lines inside the grid group (Line/LineSegments)
+  this.grid.group.traverse(obj => {
+    const m: any = (obj as any).material;
+    if (!m) return;
+    if (m.isLineBasicMaterial || obj.type === 'Line' || obj.type === 'LineSegments') {
+      m.color?.setHex(OCEAN_GRID);
+      m.transparent = true;
+      m.opacity = 0.45; // subtle, readable
+    }
+  });
+}
+
 this._createCausticsWash();
 
     // Fertility overlays
@@ -418,6 +460,81 @@ private createCropMesh(stage: 0|1|2|3): THREE.Mesh {
   mesh.castShadow = false;
   mesh.receiveShadow = false;
   return mesh;
+}
+private _installDreamPoolGround() {
+  // Gentle sky tint so the scene isn’t so dark
+  const hemi = new THREE.HemisphereLight(0x6D79FF, 0x0B1120, 0.25);
+  this.scene.add(hemi);
+
+  const mat = new THREE.ShaderMaterial({
+    transparent: false,
+    depthWrite: true,
+    uniforms: {
+      uTime:      { value: 0 },
+      uColorA:    { value: new THREE.Color(DREAM_COL_A) },
+      uColorB:    { value: new THREE.Color(DREAM_COL_B) },
+      uCaus:      { value: new THREE.Color(DREAM_CAUSTICS) },
+      uLav:       { value: new THREE.Color(DREAM_LAVENDER) },
+      uScale:     { value: DREAM_SCALE },
+      uIntensity: { value: DREAM_INTENSITY },
+    },
+    vertexShader: /* glsl */`
+      varying vec2 vWorld;
+      void main() {
+        vec4 w = modelMatrix * vec4(position, 1.0);
+        vWorld = w.xz;                      // world coords on the plane
+        gl_Position = projectionMatrix * viewMatrix * w;
+      }
+    `,
+    fragmentShader: /* glsl */`
+      varying vec2 vWorld;
+      uniform float uTime, uScale, uIntensity;
+      uniform vec3  uColorA, uColorB, uCaus, uLav;
+
+      // lightweight sine-based caustics with domain warping (no textures)
+      float caustics(vec2 p, float t){
+        p *= uScale;                         // scale in world space
+        // domain warp (slow swirl)
+        vec2 q = p + 0.35 * vec2(
+          sin(p.y*1.7 + t*0.35),
+          cos(p.x*1.3 - t*0.45)
+        );
+        // layered interference
+        float c = 0.0;
+        c += sin(q.x*3.2 + t*0.9)*sin(q.y*2.9 - t*0.7);
+        c += 0.5*sin(dot(q, vec2(1.2,-1.1))*2.4 + t*0.6);
+        c = abs(c);
+        return smoothstep(0.35, 0.95, c);    // thin bright lines
+      }
+
+      void main() {
+        float t = uTime;
+
+        // dreamy diagonal gradient base
+        float g = clamp(0.5 + 0.5 * (vWorld.x + vWorld.y) * 0.05, 0.0, 1.0);
+        vec3 base = mix(uColorA, uColorB, g);
+
+        // soft caustics wash (slightly lavender-tinted highlights)
+        float c = caustics(vWorld, t);
+        vec3 glow = mix(uCaus, uLav, 0.3);
+        base += glow * (uIntensity * c);
+
+        gl_FragColor = vec4(base, 1.0);
+      }
+    `
+  });
+
+  this.grid.plane.material = mat;
+
+  // Make grid lines a bit lighter so they read over the dreamy ground
+  this.grid.group.traverse(o => {
+    const m: any = (o as any).material;
+    if (m?.isLineBasicMaterial) {
+      m.color?.setHex(0x6D87B3); // misty blue
+      m.opacity = 0.35;
+      m.transparent = true;
+    }
+  });
 }
 
 
@@ -1003,6 +1120,11 @@ tick(grid: TileState[][]) {
 
   // Drive ripple time on crop square shaders
   const tNow = performance.now() * 0.001;
+  const gmat: any = this.grid.plane.material;
+if (gmat?.isShaderMaterial && gmat.uniforms?.uTime) {
+  gmat.uniforms.uTime.value = tNow;
+}
+
   this._tickCropShaders(tNow);
 this._tickCausticsWash(tNow);
 
